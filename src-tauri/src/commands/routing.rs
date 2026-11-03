@@ -4,7 +4,6 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::audio::types::is_virtual_sink;
-use crate::persistence::wireplumber;
 use crate::state::AppState;
 
 pub(crate) const MAX_VOLUME: u8 = 150;
@@ -251,12 +250,8 @@ fn siblings_of<'a>(
         .collect()
 }
 
-/// Move an app stream onto a channel. An empty `sink_name` unassigns the
-/// stream (returns it to the system default sink).
-///
-/// The choice is also recorded as a persistent assignment (Phase 2): saved
-/// to `$XDG_CONFIG_HOME/sink/assignments.json`, mirrored to a WirePlumber
-/// conf fragment, and re-applied by the stream poll when the app restarts.
+/// Move an app stream onto a channel; empty `sink_name` unassigns it.
+/// Persisted so the assignment reapplies when the app restarts.
 #[tauri::command]
 pub fn route_app_to_channel(
     state: State<'_, AppState>,
@@ -271,8 +266,9 @@ pub fn route_app(state: &AppState, stream_index: u32, sink_name: &str) -> Result
         return Err(format!("unknown channel: {sink_name}"));
     }
 
-    // Assignments are per app, not per stream: siblings move too.
-    let streams = state.backend.list_app_streams().map_err(|e| e.to_string())?;
+    // Assignments are per app, not per stream: siblings move too, and the
+    // rule is keyed on the identity the user saw, not the raw stream.
+    let streams = crate::commands::devices::live_streams(state)?;
     let Some(stream) = streams.iter().find(|s| s.index == stream_index) else {
         // Vanished between the click and now; move the raw index anyway in
         // case the listing raced, with nothing to record against it.
@@ -295,7 +291,8 @@ pub fn route_app(state: &AppState, stream_index: u32, sink_name: &str) -> Result
                 .assignments
                 .set(&stream.match_prop, &stream.match_value, sink_name);
         }
-        // The user explicitly placed these streams; don't auto-route them again.
+        // The user explicitly placed these streams; don't auto-route them
+        // again.
         mixer.auto_routed.insert(stream.serial);
         mixer.auto_routed.extend(siblings.iter().map(|s| s.serial));
         crate::commands::profiles::autosave_active(&mixer);
@@ -316,7 +313,6 @@ pub fn route_app(state: &AppState, stream_index: u32, sink_name: &str) -> Result
     }
 
     assignments.save().map_err(|e| e.to_string())?;
-    wireplumber::write(&assignments).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -328,7 +324,7 @@ pub fn set_channel_volume(
     volume: u8,
 ) -> Result<(), String> {
     // Only our own channels, so a compromised webview can't touch arbitrary
-    // session sinks (TD-050).
+    // session sinks.
     if !is_virtual_sink(&sink_name) {
         return Err(format!("unknown channel: {sink_name}"));
     }
@@ -343,9 +339,8 @@ pub fn set_channel_volume(
         if let Some(channel) = mixer.channel_mut(&sink_name) {
             channel.volume_percent = volume;
         }
-        // Persist the level itself, not just into an active profile - a
-        // channel must come back at the volume you left it at even when
-        // no profile is bound.
+        // Persist the level itself, not just into an active profile - a channel
+        // must come back at its last volume even when no profile is bound.
         mixer.channel_defs.set_volume(&sink_name, volume);
         crate::commands::profiles::autosave_active(&mixer);
         mixer.channel_defs.clone()
@@ -392,12 +387,16 @@ pub fn set_monitor(
     sink_name: String,
     enabled: bool,
 ) -> Result<(), String> {
-    // Monitoring is scoped to our own nodes: a channel, a mix bus, or the mic
-    // (TD-050) - not any arbitrary session sink.
+    // Monitoring is scoped to our own nodes: a channel, a mix bus, or the mic -
+    // not any arbitrary session sink.
     {
         let mixer = state.lock_mixer()?;
         let known = sink_name == "sink_mic"
-            || mixer.channel_defs.channels.iter().any(|c| c.name == sink_name)
+            || mixer
+                .channel_defs
+                .channels
+                .iter()
+                .any(|c| c.name == sink_name)
             || mixer.buses.buses.iter().any(|b| b.name == sink_name);
         if !known {
             return Err(format!("unknown monitor target: {sink_name}"));
@@ -469,10 +468,8 @@ mod tests {
         )]));
         let state = Arc::new(app(backend.clone()));
 
-        // Observe from inside the move: the enforcement ticker runs
-        // concurrently, so the assignment and the ledger must already say
-        // where this stream belongs, or a tick landing here corrects the
-        // move straight back.
+        // Observe from inside the move: the ticker runs concurrently, so the
+        // assignment and ledger must already reflect this stream's new home.
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (probe, probed_state) = (Arc::clone(&seen), Arc::clone(&state));
         backend.on_move(move |_, _| {
@@ -567,6 +564,8 @@ mod tests {
             volume_percent: 100,
             muted: false,
             active: true,
+            props: Default::default(),
+            settled: true,
         }
     }
 

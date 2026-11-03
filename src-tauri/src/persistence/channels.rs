@@ -115,14 +115,8 @@ impl Channels {
         }
     }
 
-    /// Parse and sanitize the channel set from JSON. Entries that break the
-    /// invariants `add()` guarantees - a reserved name, a missing `sink_`
-    /// prefix, or a duplicate - are dropped: a hand-edited or foreign-tool
-    /// file would otherwise collide with the mic/stream service nodes, or make
-    /// `is_virtual_sink` reject a channel and abort `init_virtual_devices`.
-    /// The set is capped at `MAX_CHANNELS` so it can't exhaust the level-meter
-    /// slots. Returns `None` only when the text isn't valid JSON, so `load`
-    /// can tell a corrupt file from a merely empty one.
+    /// Sanitize the channel set (drops reserved names, missing `sink_`
+    /// prefix, duplicates); `None` means invalid JSON, not merely empty.
     fn parse(raw: &str) -> Option<Self> {
         let parsed: Self = serde_json::from_str(raw).ok()?;
         let mut seen = std::collections::HashSet::new();
@@ -171,8 +165,7 @@ impl Channels {
     }
 
     /// Record a channel's fader position so it survives a restart. Unknown
-    /// channels are ignored rather than erroring: this runs on every fader
-    /// tick, and a channel deleted mid-drag shouldn't surface an error.
+    /// channels are ignored, not erroring - this runs on every fader tick.
     pub fn set_volume(&mut self, name: &str, volume_percent: u8) {
         if let Some(def) = self.channels.iter_mut().find(|c| c.name == name) {
             def.volume_percent = volume_percent;
@@ -192,7 +185,9 @@ impl Channels {
     pub fn add(&mut self, label: &str, icon: Option<String>) -> Result<ChannelDef, SinkError> {
         let label = label.trim();
         if label.is_empty() || label.len() > 24 {
-            return Err(SinkError::Config("channel label must be 1-24 characters".into()));
+            return Err(SinkError::Config(
+                "channel label must be 1-24 characters".into(),
+            ));
         }
         if self.channels.len() >= MAX_CHANNELS {
             return Err(SinkError::Config(format!(
@@ -202,8 +197,7 @@ impl Channels {
         let mut base = format!("sink_{}", slugify(label));
         if crate::persistence::buses::is_bus_name(&base) {
             // A label like "Bus Foo" would slug straight into the mix-bus
-            // namespace, where every suffixed variant still matches the
-            // prefix; step out of it instead of trying to disambiguate.
+            // namespace; step out of it instead of disambiguating variants.
             base = base.replacen("sink_bus_", "sink_ch_bus_", 1);
         }
         let mut name = base.clone();
@@ -227,7 +221,9 @@ impl Channels {
     pub fn rename(&mut self, name: &str, label: &str) -> Result<(), SinkError> {
         let label = label.trim();
         if label.is_empty() || label.len() > 24 {
-            return Err(SinkError::Config("channel label must be 1-24 characters".into()));
+            return Err(SinkError::Config(
+                "channel label must be 1-24 characters".into(),
+            ));
         }
         let def = self
             .channels
@@ -241,15 +237,16 @@ impl Channels {
     /// Reorder the channel set. `order` must contain exactly the current
     /// sink names (it's a permutation, not an edit).
     pub fn reorder(&mut self, order: &[String]) -> Result<(), SinkError> {
-        if order.len() != self.channels.len()
-            || !order.iter().all(|n| self.get(n).is_some())
-        {
+        if order.len() != self.channels.len() || !order.iter().all(|n| self.get(n).is_some()) {
             return Err(SinkError::Config(
                 "reorder must list every existing channel exactly once".into(),
             ));
         }
         self.channels.sort_by_key(|c| {
-            order.iter().position(|n| n == &c.name).unwrap_or(usize::MAX)
+            order
+                .iter()
+                .position(|n| n == &c.name)
+                .unwrap_or(usize::MAX)
         });
         Ok(())
     }
@@ -332,7 +329,10 @@ mod tests {
         ])
         .expect("reorders");
         let names: Vec<&str> = c.channels.iter().map(|d| d.name.as_str()).collect();
-        assert_eq!(names, ["sink_music", "sink_game", "sink_system", "sink_chat"]);
+        assert_eq!(
+            names,
+            ["sink_music", "sink_game", "sink_system", "sink_chat"]
+        );
         // Wrong length and unknown names are rejected.
         assert!(c.reorder(&["sink_game".into()]).is_err());
         assert!(c
@@ -364,8 +364,8 @@ mod tests {
 
     #[test]
     fn parse_keeps_valid_and_fills_serde_defaults() {
-        // Old-shape entries (pre-Phase-4: no icon / stream_mix) must still
-        // load, with the serde defaults applied - an upgrade keeps user data.
+        // Bug shape: old-shape entries (no icon / stream_mix) must still load
+        // via serde defaults.
         let raw = r#"{"channels":[
             {"name":"sink_game","label":"Game"},
             {"name":"sink_music","label":"Music","icon":"music_note","stream_mix":false}
@@ -448,6 +448,9 @@ mod tests {
         // load() turns this into defaults; parse itself reports the empty set
         // so load can distinguish it from a corrupt (None) file.
         let raw = r#"{"channels":[{"name":"sink_mic","label":"x"},{"name":"bad","label":"y"}]}"#;
-        assert!(Channels::parse(raw).expect("valid json").channels.is_empty());
+        assert!(Channels::parse(raw)
+            .expect("valid json")
+            .channels
+            .is_empty());
     }
 }

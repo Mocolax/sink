@@ -26,17 +26,14 @@ pub struct MixerState {
     pub mic: crate::audio::types::MicConfig,
     /// Every app identity ever observed (history + ignore list).
     pub seen: crate::persistence::seen::SeenApps,
-    /// Unix seconds of the last `seen` write. The poll only saves on
-    /// structural changes, so this drives a slow flush that bounds how stale
-    /// on-disk `last_seen` timestamps can get if Sink dies without a clean
-    /// quit - the age-based prune trusts them.
+    /// Unix seconds of the last `seen` write; bounds how stale `last_seen`
+    /// gets before the age-based prune trusts it.
     pub seen_saved_at: u64,
     /// Profile changes autosave into this profile (live-bound, not a
     /// snapshot). None = unmanaged state.
     pub active_profile: Option<String>,
     /// Cached trigger device of `active_profile`, so autosave preserves it
-    /// without re-reading the profile file on every mutation. Kept in step
-    /// whenever the active profile or its trigger changes.
+    /// without re-reading the profile file on every mutation.
     pub active_trigger: Option<String>,
     /// User-defined mixes (record buses), persisted to disk.
     pub buses: crate::persistence::buses::Buses,
@@ -48,9 +45,8 @@ pub struct MixerState {
 }
 
 impl MixerState {
-    /// Populate the channel strips from the user's channel definitions,
-    /// each restored to its persisted volume/mute (100%/unmuted for a
-    /// channel that has never been touched).
+    /// Populate the channel strips, each restored to its persisted volume/mute
+    /// (100%/unmuted if the channel has never been touched).
     pub fn init_defaults(&mut self) {
         self.channels = self
             .channel_defs
@@ -73,8 +69,7 @@ impl MixerState {
     }
 
     /// Forget history entries the user never acted on and hasn't seen in a
-    /// week, so the "not running" list stays about apps they actually use.
-    /// Returns true when the history changed and should be saved.
+    /// week; returns true when something changed and should be persisted.
     pub fn prune_stale_apps(&mut self, now: u64) -> bool {
         // Disjoint field borrows: `prune` needs `seen` mutably while the
         // intent test reads the other two.
@@ -93,13 +88,8 @@ impl MixerState {
         )
     }
 
-    /// Decide which live streams to move onto their saved channel, and
-    /// record them as handled. Each stream is considered once, on first
-    /// sight, so a manual re-route (here or in pavucontrol) isn't fought;
-    /// streams that have gone away are forgotten so the ledger stays bounded.
-    ///
-    /// Returns `(stream index, target sink, app name)` for the caller to
-    /// execute once it has released the lock.
+    /// Each stream is considered once, so a manual re-route isn't fought; the
+    /// caller applies the returned moves after releasing the lock.
     pub fn plan_auto_routes(&mut self, streams: &[AppStream]) -> Vec<(u32, String, String)> {
         // Enforce only once the virtual sinks exist, or streams would be
         // marked handled while their target can't be moved to yet.
@@ -108,15 +98,12 @@ impl MixerState {
         }
         let mut planned = Vec::new();
         for stream in streams {
-            if self.auto_routed.contains(&stream.serial) {
+            if !stream.settled || self.auto_routed.contains(&stream.serial) {
                 continue;
             }
-            if let Some(target) = self
-                .assignments
-                .sink_for(&stream.match_prop, &stream.match_value)
-            {
-                if stream.assigned_sink.as_deref() != Some(target) {
-                    planned.push((stream.index, target.to_string(), stream.app_name.clone()));
+            if let Some(target) = self.rule_for(stream) {
+                if stream.assigned_sink.as_deref() != Some(target.as_str()) {
+                    planned.push((stream.index, target, stream.app_name.clone()));
                 }
             }
             self.auto_routed.insert(stream.serial);
@@ -124,6 +111,22 @@ impl MixerState {
         let live: HashSet<u64> = streams.iter().map(|s| s.serial).collect();
         self.auto_routed.retain(|serial| live.contains(serial));
         planned
+    }
+
+    /// A process identity's own rule wins; only an identity with no trusted
+    /// process falls back to a rule on the stream's own props.
+    fn rule_for(&self, stream: &AppStream) -> Option<String> {
+        self.assignments
+            .sink_for(&stream.match_prop, &stream.match_value)
+            .or_else(|| {
+                if crate::audio::identity::is_process_prop(&stream.match_prop) {
+                    return None;
+                }
+                crate::audio::identity::legacy_matchers(&stream.props)
+                    .iter()
+                    .find_map(|(prop, value)| self.assignments.sink_for(prop, value))
+            })
+            .map(str::to_string)
     }
 
     pub fn reset(&mut self) {
@@ -144,7 +147,10 @@ mod tests {
         assert!(state.initialized);
         assert_eq!(state.channels[0].name, "sink_game");
         assert_eq!(state.channels[0].label, "Game");
-        assert!(state.channels.iter().all(|c| c.volume_percent == 100 && !c.muted));
+        assert!(state
+            .channels
+            .iter()
+            .all(|c| c.volume_percent == 100 && !c.muted));
     }
 
     #[test]
@@ -154,7 +160,9 @@ mod tests {
         let old = now - 30 * DAY;
         let mut state = MixerState::default();
         for value in ["plain", "assigned", "aliased"] {
-            state.seen.upsert("application.name", value, value, None, old);
+            state
+                .seen
+                .upsert("application.name", value, value, None, None, old);
         }
         state
             .assignments
@@ -182,6 +190,8 @@ mod tests {
             volume_percent: 100,
             muted: false,
             active: true,
+            props: Default::default(),
+            settled: true,
         }
     }
 
@@ -239,7 +249,9 @@ mod tests {
             .assignments
             .set("application.name", "Firefox", "sink_game");
         assert_eq!(
-            state.plan_auto_routes(&[stream(7, 100, "Firefox", None)]).len(),
+            state
+                .plan_auto_routes(&[stream(7, 100, "Firefox", None)])
+                .len(),
             1
         );
 
@@ -247,6 +259,60 @@ mod tests {
         // serials never repeat, so the new stream is still routed.
         let planned = state.plan_auto_routes(&[stream(7, 101, "Firefox", None)]);
         assert_eq!(planned.len(), 1);
+    }
+
+    #[test]
+    fn auto_route_leaves_an_unsettled_stream_for_the_next_tick() {
+        let mut state = MixerState::default();
+        state.init_defaults();
+        state
+            .assignments
+            .set("application.name", "Firefox", "sink_game");
+        let mut early = stream(7, 100, "Firefox", None);
+        early.settled = false;
+        assert!(state.plan_auto_routes(&[early]).is_empty());
+        assert!(state.auto_routed.is_empty(), "not ledgered while unsettled");
+        assert_eq!(
+            state
+                .plan_auto_routes(&[stream(7, 100, "Firefox", None)])
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn auto_route_still_honours_a_rule_keyed_on_the_streams_own_props() {
+        // Bug shape: a rule keyed on the stream's own media.name must still
+        // apply.
+        let mut state = MixerState::default();
+        state.init_defaults();
+        state
+            .assignments
+            .set("media.name", "audio-src", "sink_music");
+        let mut s = stream(3, 30, "Unknown", None);
+        s.props
+            .insert("media.name".to_string(), "audio-src".to_string());
+        assert_eq!(
+            state.plan_auto_routes(&[s]),
+            vec![(3, "sink_music".to_string(), "Unknown".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_cleared_rule_on_a_process_identity_stays_cleared() {
+        // Bug shape: a cleared rule must not be revived by its adopted legacy
+        // rule.
+        let mut state = MixerState::default();
+        state.init_defaults();
+        state
+            .assignments
+            .set("application.name", "Discord", "sink_voice");
+        let mut s = stream(3, 30, "Discord", None);
+        s.match_prop = "process.exe".into();
+        s.match_value = "discord".into();
+        s.props
+            .insert("application.name".to_string(), "Discord".to_string());
+        assert!(state.plan_auto_routes(&[s]).is_empty());
     }
 
     #[test]

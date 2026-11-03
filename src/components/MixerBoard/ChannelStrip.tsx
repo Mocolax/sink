@@ -5,12 +5,13 @@ import { MAX_VOLUME } from "../../types";
 import { channelIcon, Ms, ICON_CHOICES } from "../Icons";
 import { ConfirmModal } from "../ConfirmModal";
 import { Popover } from "../Popover";
-import { perceptual, volToDb } from "../../lib/audio";
-import { EqModal } from "../Eq/EqModal";
+import { perceptual } from "../../lib/audio";
+import { ChannelEqModal } from "../Eq/EqModal";
 import { ChannelApps } from "./ChannelApps";
 import { Fader } from "./Fader";
 import { OutputSelect } from "./OutputSelect";
 import { StripName } from "./StripName";
+import { VolumeReadout } from "./VolumeReadout";
 import { VuMeter } from "./VuMeter";
 
 interface ChannelStripProps {
@@ -151,11 +152,11 @@ export function ChannelStrip({
         <VuMeter target={channel.muted ? 0 : perceptual(amplitude)} />
       </div>
 
-      <div className="strip-readout">
-        {channel.volume_percent}
-        <span style={{ fontSize: 11 }}>%</span>{" "}
-        <span className="db">{volToDb(channel.volume_percent)}</span>
-      </div>
+      <VolumeReadout
+        percent={channel.volume_percent}
+        max={MAX_VOLUME}
+        onChange={(v: number) => void setChannelVolume(channel.name, v)}
+      />
 
       <div className="strip-btns">
         <button
@@ -187,7 +188,7 @@ export function ChannelStrip({
         </button>
       </div>
 
-      <EqModal channel={channel} open={editingEq} onClose={() => setEditingEq(false)} />
+      <ChannelEqModal channel={channel} open={editingEq} onClose={() => setEditingEq(false)} />
 
       <OutputSelect
         compact
@@ -205,8 +206,7 @@ export function ChannelStrip({
         confirmLabel="Delete channel"
         onConfirm={() => void removeChannel(channel.name)}
       >
-        Apps routed to this channel return to the default output. Its saved
-        routing is removed.
+        Apps routed to this channel return to the default output. Its saved routing is removed.
       </ConfirmModal>
     </div>
   );

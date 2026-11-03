@@ -33,7 +33,13 @@
           "/usr/share/pixmaps/**",
           "/var/lib/flatpak/exports/share/icons/**",
           "$HOME/.local/share/icons/**",
-          "$HOME/.local/share/flatpak/exports/share/icons/**"
+          "$HOME/.local/share/flatpak/exports/share/icons/**",
+          "/var/lib/flatpak/app/**/export/share/icons/**",
+          "$HOME/.local/share/flatpak/app/**/export/share/icons/**",
+          "$HOME/.local/share/Steam/appcache/librarycache/**",
+          "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam/appcache/librarycache/**",
+          "$HOME/.steam/steam/appcache/librarycache/**",
+          "$HOME/snap/steam/common/.local/share/Steam/appcache/librarycache/**"
         ]
       }
     }
@@ -50,7 +56,8 @@
           "wireplumber"
         ],
         "files": {
-          "/usr/lib/udev/rules.d/70-sink-arctis-nova7.rules": "../packaging/70-sink-arctis-nova7.rules"
+          "/usr/lib/udev/rules.d/70-sink-arctis-nova7.rules": "../packaging/70-sink-arctis-nova7.rules",
+          "/usr/share/applications/us.echo.Sink.desktop": "../packaging/linux/us.echo.Sink.desktop"
         }
       },
       "rpm": {
@@ -59,14 +66,12 @@
           "pulseaudio-utils",
           "pipewire-pulseaudio",
           "wireplumber"
-        ]
+        ],
+        "files": {
+          "/usr/share/applications/us.echo.Sink.desktop": "../packaging/linux/us.echo.Sink.desktop"
+        }
       }
     },
-    "icon": [
-      "icons/32x32.png",
-      "icons/128x128.png",
-      "icons/128x128@2x.png",
-      "icons/icon.png"
-    ]
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.png"]
   }
 }

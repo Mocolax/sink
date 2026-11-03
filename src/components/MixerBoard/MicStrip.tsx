@@ -2,12 +2,13 @@ import { useState } from "react";
 import { useMixerStore } from "../../store/mixer";
 import { MAX_MIC_GAIN, MIC_LEVEL_KEY } from "../../types";
 import { perceptual } from "../../lib/audio";
+import { EqModal } from "../Eq/EqModal";
 import { Ms } from "../Icons";
 import { Fader } from "./Fader";
+import { VolumeReadout } from "./VolumeReadout";
 import { VuMeter } from "./VuMeter";
 
-/** Mic channel strip (Phase 3): fader = chain gain, meters = processed
- * signal. Only rendered while the mic chain is enabled. */
+/** Fader is the chain gain and the meters show the processed signal. */
 export function MicStrip() {
   const micConfig = useMixerStore((s) => s.micConfig);
   const setMicConfig = useMixerStore((s) => s.setMicConfig);
@@ -15,6 +16,7 @@ export function MicStrip() {
   const monitoring = useMixerStore((s) => s.monitors[MIC_LEVEL_KEY] ?? false);
   const toggleMonitor = useMixerStore((s) => s.toggleMonitor);
   const [editing, setEditing] = useState(false);
+  const [editingEq, setEditingEq] = useState(false);
   const [draft, setDraft] = useState("");
 
   if (!micConfig?.enabled) return null;
@@ -22,14 +24,13 @@ export function MicStrip() {
   const commitRename = () => {
     setEditing(false);
     const label = draft.trim();
-    if (label && label !== micConfig.output_label)
-      void setMicConfig({ output_label: label });
+    if (label && label !== micConfig.output_label) void setMicConfig({ output_label: label });
   };
 
   const target = micConfig.muted ? 0 : perceptual(level?.[0] ?? 0);
 
   return (
-      <div className={"strip input-strip" + (micConfig.muted ? " muted" : "")}>
+    <div className={"strip input-strip" + (micConfig.muted ? " muted" : "")}>
       <div className="strip-head">
         <div className="strip-icon strip-icon-mic">
           <Ms name="mic" />
@@ -71,11 +72,12 @@ export function MicStrip() {
         <VuMeter target={target} />
       </div>
 
-      <div className="strip-readout">
-        {micConfig.gain_percent}
-        <span style={{ fontSize: 11 }}>%</span>{" "}
-        <span className="db">gain</span>
-      </div>
+      <VolumeReadout
+        percent={micConfig.gain_percent}
+        max={MAX_MIC_GAIN}
+        unit="gain"
+        onChange={(v: number) => void setMicConfig({ gain_percent: v })}
+      />
 
       <div className="strip-btns">
         <button
@@ -96,9 +98,27 @@ export function MicStrip() {
         >
           <Ms name="headphones" style={{ fontSize: 16 }} />
         </button>
+        <button
+          type="button"
+          className={"sbtn" + (micConfig.eq.enabled ? " on-eq" : "")}
+          onClick={() => setEditingEq(true)}
+          aria-pressed={micConfig.eq.enabled}
+          title="Equalizer"
+        >
+          <Ms name="tune" style={{ fontSize: 16 }} />
+        </button>
       </div>
 
+      <EqModal
+        name={micConfig.output_label || "Microphone"}
+        target="mic"
+        config={micConfig.eq}
+        onChange={(eq) => void setMicConfig({ eq })}
+        open={editingEq}
+        onClose={() => setEditingEq(false)}
+      />
+
       <div className="strip-route" />
-      </div>
+    </div>
   );
 }

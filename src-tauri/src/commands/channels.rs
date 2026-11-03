@@ -1,9 +1,7 @@
 use tauri::State;
 
 use crate::audio::types::VirtualSink;
-use crate::persistence::wireplumber;
 use crate::state::AppState;
-
 
 /// Create a new channel from a label and icon (sink name is generated).
 /// The new channel starts at 100%, unmuted, following the default output.
@@ -79,9 +77,12 @@ pub fn reorder_channels(state: State<'_, AppState>, order: Vec<String>) -> Resul
             .reorder(&order)
             .map_err(|e| e.to_string())?;
         // Keep the live strip list in the same order.
-        mixer
-            .channels
-            .sort_by_key(|c| order.iter().position(|n| n == &c.name).unwrap_or(usize::MAX));
+        mixer.channels.sort_by_key(|c| {
+            order
+                .iter()
+                .position(|n| n == &c.name)
+                .unwrap_or(usize::MAX)
+        });
         crate::commands::profiles::autosave_active(&mixer);
         mixer.channel_defs.clone()
     };
@@ -195,12 +196,12 @@ pub fn remove_channel(state: State<'_, AppState>, sink_name: String) -> Result<(
             .backend
             .set_bus_members(&bus.name, &bus.effective_members(&names));
     }
+    crate::commands::devices::route_now(state.inner());
 
     defs.save().map_err(|e| e.to_string())?;
     assignments.save().map_err(|e| e.to_string())?;
     outputs.save().map_err(|e| e.to_string())?;
     eq.save().map_err(|e| e.to_string())?;
     buses.save().map_err(|e| e.to_string())?;
-    wireplumber::write(&assignments).map_err(|e| e.to_string())?;
     Ok(())
 }

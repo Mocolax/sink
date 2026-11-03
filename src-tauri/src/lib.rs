@@ -2,11 +2,14 @@ mod audio;
 mod commands;
 mod error;
 mod hardware;
+mod hotkeys;
 mod mixer;
 mod persistence;
 mod state;
+mod webkit;
 
 use std::collections::HashMap;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -91,28 +94,35 @@ fn dispatch_channel_group_action(app: tauri::AppHandle, action: ChannelGroupActi
 }
 
 pub fn run() {
-    // Prefer the native PipeWire backend (Phase 2); fall back to pactl
-    // subprocess calls if the native loop can't come up. Levels (real VU
-    // metering) are native-only.
-    let (backend, levels): (Arc<dyn AudioBackend>, Option<Arc<LevelStore>>) =
-        match PipeWireBackend::new() {
-            Ok(backend) => {
-                let levels = backend.levels.clone();
-                (Arc::new(backend), Some(levels))
-            }
-            Err(e) => {
-                eprintln!("sink: native PipeWire backend unavailable ({e}); using pactl fallback");
-                (Arc::new(PactlBackend::new()), None)
-            }
-        };
+    // Fall back to pactl subprocess calls if the native PipeWire loop can't
+    // come up; real VU metering and event-driven routing are native-only.
+    let native = PipeWireBackend::new()
+        .map_err(|e| {
+            eprintln!("sink: native PipeWire backend unavailable ({e}); using pactl fallback");
+        })
+        .ok();
+    let levels = native.as_ref().map(|(backend, _)| backend.levels.clone());
+    let (backend, stream_wake): (Arc<dyn AudioBackend>, _) = match native {
+        Some((backend, stream_wake)) => (Arc::new(backend), Some(stream_wake)),
+        None => (Arc::new(PactlBackend::new()), None),
+    };
     let backend_native = levels.is_some();
     let app_state = AppState::new(backend, backend_native);
 
+    // WebKitGTK 2.54 won't paint a transparent window on some GPUs; make it
+    // opaque there. The `opaque=1` flag lets the UI square the filled corners.
+    let mut context = tauri::generate_context!();
+    if webkit::needs_opaque_window() {
+        for window in context.config_mut().app.windows.iter_mut() {
+            window.transparent = false;
+            window.background_color = Some(tauri::utils::config::Color(10, 10, 11, 255));
+            window.url = tauri::utils::config::WebviewUrl::App("index.html?opaque=1".into());
+        }
+    }
+
     let result = tauri::Builder::default()
-        // Single-instance guard (must be the first plugin). A second launch
-        // focuses the running window instead of spawning a duplicate - two
-        // instances would create clashing virtual sinks and fight over the
-        // audio graph. Sink hides to tray, so unhide + focus the existing one.
+        // Must stay first: a second launch would spawn a duplicate fighting
+        // over the same virtual sinks.
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             if let Some(action) = commands::routing::channel_group_action_from_args(&argv) {
                 dispatch_channel_group_action(app.clone(), action);
@@ -126,6 +136,7 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .manage(app_state)
+        .manage(hotkeys::Hotkeys::default())
         .invoke_handler(tauri::generate_handler![
             commands::devices::get_virtual_devices,
             commands::devices::get_app_streams,
@@ -153,6 +164,7 @@ pub fn run() {
             commands::buses::set_bus_members,
             commands::buses::set_bus_mic,
             commands::buses::set_bus_exclude,
+            commands::buses::set_bus_role,
             commands::buses::set_bus_volume,
             commands::buses::set_bus_mute,
             commands::buses::set_bus_member_gain,
@@ -166,13 +178,17 @@ pub fn run() {
             commands::mic::get_mic_config,
             commands::mic::set_mic_config,
             commands::mic::get_input_devices,
+            commands::mic::get_noise_engine,
+            commands::mic::download_noise_engine,
+            commands::mic::retry_noise_engine,
+            commands::mic::remove_noise_engine,
+            commands::mic::open_noise_engine_page,
             commands::eq::get_channel_eq_configs,
             commands::eq::set_channel_eq,
             commands::eq::list_eq_presets,
             commands::eq::save_user_eq_preset,
             commands::eq::delete_user_eq_preset,
-            commands::eq::export_channel_eq,
-            commands::eq::export_channel_eq_to_file,
+            commands::eq::export_eq_to_file,
             commands::eq::import_eq_config,
             commands::eq::import_eq_file,
             commands::profiles::list_profiles,
@@ -198,9 +214,14 @@ pub fn run() {
             commands::settings::set_arctis_output,
             commands::settings::get_arctis_status,
             commands::settings::reset_app,
+            commands::hotkeys::get_hotkeys,
+            commands::hotkeys::configure_hotkeys,
+            commands::hotkeys::set_hotkey_binding,
+            commands::hotkeys::set_balance_step,
         ])
         .setup(move |app| {
             build_tray(app)?;
+            hotkeys::start(app.handle().clone());
             let args = std::env::args().collect::<Vec<_>>();
             let channel_group_action = commands::routing::channel_group_action_from_args(&args);
             // The window starts hidden (config) to avoid a flash; show it
@@ -215,7 +236,8 @@ pub fn run() {
             if let Some(levels) = levels {
                 spawn_level_emitter(app.handle().clone(), levels);
             }
-            spawn_route_enforcer(app.handle().clone());
+            persistence::wireplumber::remove_stale();
+            spawn_route_enforcer(app.handle().clone(), stream_wake);
             hardware::spawn(app.handle().clone());
             if let Some(action) = channel_group_action {
                 dispatch_channel_group_action(app.handle().clone(), action);
@@ -235,7 +257,7 @@ pub fn run() {
                 }
             }
         })
-        .run(tauri::generate_context!());
+        .run(context);
 
     if let Err(e) = result {
         eprintln!("sink: fatal error while running tauri application: {e}");
@@ -243,9 +265,8 @@ pub fn run() {
     }
 }
 
-/// The gap before a new stream lands on its channel is audible; a native
-/// check costs ~150us.
-const ROUTE_ENFORCE_INTERVAL: Duration = Duration::from_millis(200);
+/// Backstop for the native backend, which routes on stream events.
+const ROUTE_ENFORCE_FALLBACK: Duration = Duration::from_secs(2);
 
 /// pactl forks two processes per check.
 const ROUTE_ENFORCE_INTERVAL_PACTL: Duration = Duration::from_secs(2);
@@ -253,22 +274,30 @@ const ROUTE_ENFORCE_INTERVAL_PACTL: Duration = Duration::from_secs(2);
 /// Longer than the UI's 2s poll; clock-based so a stalled webview is covered.
 const UI_POLL_GRACE: Duration = Duration::from_secs(5);
 
-/// Enforces assignments from the backend; the UI poll pauses in the tray (TD-009).
-fn spawn_route_enforcer(handle: tauri::AppHandle) {
+/// Enforces assignments from the backend; the UI poll pauses in the tray.
+/// `stream_wake` (native only) triggers a pass as soon as a stream is ready.
+fn spawn_route_enforcer(handle: tauri::AppHandle, stream_wake: Option<Receiver<()>>) {
     std::thread::spawn(move || {
-        let native = handle.state::<AppState>().backend_native;
-        let interval = if native {
-            ROUTE_ENFORCE_INTERVAL
-        } else {
-            ROUTE_ENFORCE_INTERVAL_PACTL
-        };
         let mut last_error: Option<String> = None;
         let mut failures: u32 = 0;
         loop {
-            let pause = if failures >= 3 { interval * 10 } else { interval };
-            std::thread::sleep(pause);
+            if let Some(wake) = &stream_wake {
+                // The fallback is already slow enough to double as a backoff,
+                // and a new stream should still route while the backend fails.
+                if let Err(RecvTimeoutError::Disconnected) =
+                    wake.recv_timeout(ROUTE_ENFORCE_FALLBACK)
+                {
+                    // The PipeWire loop exited.
+                    break;
+                }
+            } else if failures >= 3 {
+                // Back off while the backend keeps failing.
+                std::thread::sleep(ROUTE_ENFORCE_INTERVAL_PACTL * 10);
+            } else {
+                std::thread::sleep(ROUTE_ENFORCE_INTERVAL_PACTL);
+            }
             let state = handle.state::<AppState>();
-            if !native && state.ui_polled_within(UI_POLL_GRACE) {
+            if !state.backend_native && state.ui_polled_within(UI_POLL_GRACE) {
                 continue;
             }
             match commands::devices::refresh_streams(state.inner()) {
@@ -295,9 +324,8 @@ fn spawn_level_emitter(handle: tauri::AppHandle, levels: Arc<LevelStore>) {
         let mut prev_all_zero = false;
         loop {
             std::thread::sleep(Duration::from_millis(100));
-            // The app's dominant state is sitting in the tray during a game.
-            // Don't lock the registry, serialize a map and wake the webview
-            // for a window nobody can see (TD-008).
+            // The app's dominant state is sitting in the tray; don't lock the
+            // registry, serialize a map, and wake a webview nobody can see.
             let onscreen = handle
                 .get_webview_window("main")
                 .map(|w| w.is_visible().unwrap_or(true) && !w.is_minimized().unwrap_or(false))
@@ -330,9 +358,7 @@ fn spawn_level_emitter(handle: tauri::AppHandle, levels: Arc<LevelStore>) {
 
 /// Build the tray menu, including the live Profiles submenu (check on the
 /// active profile). Rebuilt via `refresh_tray` whenever profiles change.
-fn build_tray_menu(
-    app: &tauri::AppHandle,
-) -> Result<Menu<tauri::Wry>, Box<dyn std::error::Error>> {
+fn build_tray_menu(app: &tauri::AppHandle) -> Result<Menu<tauri::Wry>, Box<dyn std::error::Error>> {
     use tauri::menu::{IsMenuItem, Submenu};
 
     let show = MenuItem::with_id(app, "show", "Show Window", true, None::<&str>)?;
@@ -397,11 +423,7 @@ fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             let id = event.id.as_ref();
             if let Some(name) = id.strip_prefix("profile:") {
                 // Switch profiles straight from the tray; tell the UI.
-                match commands::profiles::load_profile(
-                    app.clone(),
-                    app.state(),
-                    name.to_string(),
-                ) {
+                match commands::profiles::load_profile(app.clone(), app.state(), name.to_string()) {
                     Ok(()) => {
                         let _ = app.emit("profile-changed", name);
                     }

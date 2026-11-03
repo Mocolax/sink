@@ -11,6 +11,11 @@ pub struct AppState {
     /// True when the native PipeWire backend is driving (vs pactl fallback).
     pub backend_native: bool,
     pub mixer: Mutex<MixerState>,
+    /// Held for a whole profile load, which takes the mixer lock piecemeal.
+    pub profile_switch: Mutex<()>,
+    /// Held while a mix node is torn down and rebuilt, so a hotkey or tray
+    /// profile switch mid-rebuild can't see it half-built.
+    pub bus_rebuild: Mutex<()>,
     /// Lets the pactl-backend ticker yield while an on-screen window is
     /// already polling (see `lib::spawn_route_enforcer`).
     ui_stream_poll: Mutex<Option<Instant>>,
@@ -25,6 +30,13 @@ pub struct AppState {
     /// Long-lived hardware worker state. The worker itself is spawned during
     /// Tauri setup and remains active while the app is hidden in the tray.
     pub hardware: Arc<crate::hardware::HardwareRuntime>,
+    /// Per stream serial, dropped with the stream, so a recycled pid inherits
+    /// nothing.
+    pub identity_cache: Mutex<HashMap<u64, crate::audio::identity::Identity>>,
+    /// Icon and display name per identity key, evicted with the identities.
+    pub icon_cache: Mutex<HashMap<String, crate::audio::icons::IconFacts>>,
+    /// The same for history rows, which the UI lists every tick.
+    pub history_cache: Mutex<HashMap<String, crate::commands::apps::HistoryFacts>>,
 }
 
 impl AppState {
@@ -50,6 +62,13 @@ impl AppState {
         self.mixer
             .lock()
             .map_err(|_| "mixer state lock poisoned".to_string())
+    }
+
+    /// Never taken while the mixer lock is held, so it cannot deadlock.
+    pub fn lock_bus_rebuild(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.bus_rebuild
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn new(backend: Arc<dyn AudioBackend>, backend_native: bool) -> Self {
@@ -89,23 +108,33 @@ impl AppState {
             backend,
             backend_native,
             mixer: Mutex::new(mixer),
+            profile_switch: Mutex::new(()),
+            bus_rebuild: Mutex::new(()),
             ui_stream_poll: Mutex::new(None),
             refresh_gate: Mutex::new(()),
             channel_group_gate: Mutex::new(()),
             channel_group_mute_restore: Mutex::new(None),
             hardware: Arc::new(crate::hardware::HardwareRuntime::default()),
+            identity_cache: Mutex::new(HashMap::new()),
+            icon_cache: Mutex::new(HashMap::new()),
+            history_cache: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Best-effort teardown of all virtual sinks. Collects error messages
-    /// instead of aborting on the first failure so a single bad unload
-    /// doesn't leave the remaining sinks behind.
+    /// Best-effort teardown of all virtual sinks: collects errors instead of
+    /// aborting on first failure, so one bad unload doesn't strand the rest.
     pub fn teardown_virtual_sinks(&self) -> Vec<String> {
         self.hardware.mark_audio_unready();
         let names: Vec<String> = self
             .mixer
             .lock()
-            .map(|m| m.channel_defs.channels.iter().map(|c| c.name.clone()).collect())
+            .map(|m| {
+                m.channel_defs
+                    .channels
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect()
+            })
             .unwrap_or_default();
         let mut errors = Vec::new();
         for name in names {

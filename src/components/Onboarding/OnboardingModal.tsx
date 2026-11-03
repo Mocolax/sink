@@ -11,8 +11,7 @@ interface Step {
 }
 
 /** The signal-flow picture: apps → channels → ears, with mixes tapping
- * channels for recorders. Styled like the mixer itself (channel = indigo,
- * mix = amber). */
+ * channels for recorders. Styled like the mixer itself. */
 function FlowDiagram() {
   return (
     <div className="ob-flow">
@@ -110,7 +109,11 @@ export function OnboardingModal() {
             Back
           </button>
           <ObDots step={step} />
-          <button type="button" className="modal-btn primary" onClick={() => void finishOnboarding(false)}>
+          <button
+            type="button"
+            className="modal-btn primary"
+            onClick={() => void finishOnboarding(false)}
+          >
             Done
           </button>
         </div>
@@ -121,8 +124,8 @@ export function OnboardingModal() {
       <>
         <div className="modal-title">How do you want to start?</div>
         <p className="modal-text">
-          Either way you can add, rename or delete channels whenever - this just
-          lays out your first board.
+          Either way you can add, rename or delete channels whenever - this just lays out your first
+          board.
         </p>
         <div className="ob-choices">
           <button type="button" className="ob-choice" onClick={() => void finishOnboarding(false)}>
@@ -164,7 +167,11 @@ export function OnboardingModal() {
               Back
             </button>
           ) : (
-            <button type="button" className="modal-btn" onClick={() => void finishOnboarding(false)}>
+            <button
+              type="button"
+              className="modal-btn"
+              onClick={() => void finishOnboarding(false)}
+            >
               Skip
             </button>
           )}

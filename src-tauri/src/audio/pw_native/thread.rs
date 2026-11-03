@@ -16,13 +16,16 @@ use pw::registry::{GlobalObject, RegistryRc};
 use pw::spa::utils::dict::DictRef;
 use pw::types::ObjectType;
 
+use crate::audio::deepfilter::{self, EngineProcess, EngineState};
 use crate::audio::pw_native::eq_chain::EqChainHandle;
 use crate::audio::pw_native::levels::LevelStore;
 use crate::audio::pw_native::meter::MeterHandle;
 use crate::audio::pw_native::mic::{MicStreams, MIC_NODE};
 use crate::audio::pw_native::pods;
 use crate::audio::pw_native::send_gain::SendGainHandle;
-use crate::audio::types::{is_virtual_sink, AppStream, EqConfig, MicConfig, OutputDevice};
+use crate::audio::types::{
+    is_own_sink, is_virtual_sink, AppStream, EqConfig, MicConfig, NoiseSuppression, OutputDevice,
+};
 use crate::error::SinkError;
 use crate::persistence::buses::is_bus_name;
 
@@ -41,41 +44,131 @@ type Reply<T> = mpsc::Sender<Result<T, SinkError>>;
 type LinkSet = Vec<(u32, u32, pw::link::Link)>;
 
 pub enum Cmd {
-    CreateSink { name: String, label: String, reply: Reply<()> },
-    DestroySink { name: String, reply: Reply<()> },
-    ListStreams { reply: Reply<Vec<AppStream>> },
-    ListOutputs { reply: Reply<Vec<OutputDevice>> },
-    ResolvedOutputs { reply: Reply<HashMap<String, Option<String>>> },
-    PreferredOutputExcluding { excluded: String, reply: Reply<Option<String>> },
-    SetNodeVolumeByName { name: String, percent: u8, reply: Reply<()> },
-    SetNodeMuteByName { name: String, muted: bool, reply: Reply<()> },
-    SetNodeVolumeById { id: u32, percent: u8, reply: Reply<()> },
-    MoveStream { id: u32, sink_name: String, reply: Reply<()> },
+    /// The pid lets the loop ignore an exit from an engine it already replaced.
+    EngineExited {
+        pid: u32,
+    },
+    CreateSink {
+        name: String,
+        label: String,
+        reply: Reply<()>,
+    },
+    DestroySink {
+        name: String,
+        reply: Reply<()>,
+    },
+    ListStreams {
+        reply: Reply<Vec<AppStream>>,
+    },
+    ListOutputs {
+        reply: Reply<Vec<OutputDevice>>,
+    },
+    ResolvedOutputs {
+        reply: Reply<HashMap<String, Option<String>>>,
+    },
+    PreferredOutputExcluding {
+        excluded: String,
+        reply: Reply<Option<String>>,
+    },
+    SetNodeVolumeByName {
+        name: String,
+        percent: u8,
+        reply: Reply<()>,
+    },
+    SetNodeMuteByName {
+        name: String,
+        muted: bool,
+        reply: Reply<()>,
+    },
+    SetNodeVolumeById {
+        id: u32,
+        percent: u8,
+        reply: Reply<()>,
+    },
+    MoveStream {
+        id: u32,
+        sink_name: String,
+        reply: Reply<()>,
+    },
     /// Route a channel's monitor to an output device (None = follow default).
-    SetChannelOutput { sink_name: String, output_name: Option<String>, reply: Reply<()> },
-    SetChannelFailover { sink_name: String, enabled: bool, reply: Reply<()> },
+    SetChannelOutput {
+        sink_name: String,
+        output_name: Option<String>,
+        reply: Reply<()>,
+    },
+    SetChannelFailover {
+        sink_name: String,
+        enabled: bool,
+        reply: Reply<()>,
+    },
     /// Create a mix bus (capturable virtual source).
-    CreateBus { name: String, label: String, reply: Reply<()> },
+    CreateBus {
+        name: String,
+        label: String,
+        role: crate::persistence::buses::MixRole,
+        reply: Reply<()>,
+    },
     /// Destroy a mix bus and its links.
-    DestroyBus { name: String, reply: Reply<()> },
+    DestroyBus {
+        name: String,
+        reply: Reply<()>,
+    },
     /// Replace the channel set feeding a bus.
-    SetBusMembers { name: String, channels: Vec<String>, reply: Reply<()> },
+    SetBusMembers {
+        name: String,
+        channels: Vec<String>,
+        reply: Reply<()>,
+    },
     /// Include (or drop) the virtual mic as a member of a bus.
-    SetBusMic { name: String, mic: bool, reply: Reply<()> },
+    SetBusMic {
+        name: String,
+        mic: bool,
+        reply: Reply<()>,
+    },
     /// Set one member's send level within one specific mix (0-150%).
-    SetBusMemberGain { bus_name: String, member: String, percent: u8, reply: Reply<()> },
+    SetBusMemberGain {
+        bus_name: String,
+        member: String,
+        percent: u8,
+        reply: Reply<()>,
+    },
     /// Listen to a channel/mix/mic on the default output (session scoped).
-    SetMonitor { name: String, enabled: bool, reply: Reply<()> },
+    SetMonitor {
+        name: String,
+        enabled: bool,
+        reply: Reply<()>,
+    },
     /// Apply mic chain configuration (create/destroy/re-tune as needed).
-    SetMicConfig { config: MicConfig, reply: Reply<()> },
+    SetMicConfig {
+        config: MicConfig,
+        reply: Reply<()>,
+    },
+    RetryEngine {
+        reply: Reply<()>,
+    },
+    EngineState {
+        reply: Reply<EngineState>,
+    },
     /// Apply a channel's parametric EQ (create/destroy/re-tune the insert).
-    SetChannelEq { sink_name: String, config: EqConfig, reply: Reply<()> },
+    SetChannelEq {
+        sink_name: String,
+        config: EqConfig,
+        reply: Reply<()>,
+    },
     /// Hardware capture devices (microphones).
-    ListInputs { reply: Reply<Vec<OutputDevice>> },
+    ListInputs {
+        reply: Reply<Vec<OutputDevice>>,
+    },
     /// Current system defaults: (output sink name, input source name).
-    GetDefaults { reply: Reply<(Option<String>, Option<String>)> },
+    GetDefaults {
+        reply: Reply<(Option<String>, Option<String>)>,
+    },
     /// Set the configured system default sink (input=false) or source.
-    SetDefault { input: bool, name: String, reply: Reply<()> },
+    SetDefault {
+        input: bool,
+        name: String,
+        reply: Reply<()>,
+    },
 }
 
 struct PortEntry {
@@ -99,11 +192,24 @@ struct NodeEntry {
     muted: bool,
     /// True while the node is in the Running state (actively streaming).
     active: bool,
+    /// Set once the info event delivered the full property dict.
+    described: bool,
+}
+
+/// Nodes through pipewire-pulse carry few props; pid and sandbox facts live
+/// here.
+struct ClientEntry {
+    props: HashMap<String, String>,
+    /// Set once the info event delivered the full property dict.
+    settled: bool,
+    _proxy: pw::client::Client,
+    _listener: pw::client::ClientListener,
 }
 
 #[derive(Default)]
 struct State {
     nodes: HashMap<u32, NodeEntry>,
+    clients: HashMap<u32, ClientEntry>,
     /// link global id -> (output node id, input node id)
     links: HashMap<u32, (u32, u32)>,
     metadata: Option<Metadata>,
@@ -113,12 +219,12 @@ struct State {
     /// Virtual sinks we created: name -> created-object proxy (kept alive;
     /// destroyed explicitly on teardown).
     owned_sinks: HashMap<String, Node>,
-    /// Sinks that existed before us (e.g. leftover pactl modules): name -> global id.
+    /// Sinks that existed before us (e.g. leftover pactl modules): name ->
+    /// global id.
     adopted_sinks: HashMap<String, u32>,
-    /// Nodes that must stay alive: name -> (label, kind 0=sink 1=bus 2=mic).
-    /// If one vanishes without us destroying it (another instance dying,
-    /// a PipeWire restart, wpctl) it gets recreated on the spot.
-    desired: HashMap<String, (String, u8)>,
+    /// Nodes that must stay alive; if one vanishes without us destroying it
+    /// (another instance, a PipeWire restart, wpctl), it is recreated in place.
+    desired: HashMap<String, (String, NodeKind)>,
     /// Create requests waiting for the sink's global to appear.
     pending_creates: HashMap<String, Vec<Reply<()>>>,
     /// Live meter capture streams per virtual sink name.
@@ -130,24 +236,22 @@ struct State {
 
     /// Channel sink name -> live loopback links.
     channel_links: HashMap<String, LinkSet>,
-    /// Channel sink name -> the device node id it currently routes to (after
-    /// explicit/default/fallback resolution). Lets the UI show what "System
-    /// default" actually resolves to, and makes failover visible.
+    /// Channel sink name -> the device node id it currently routes to, after
+    /// explicit/default/fallback resolution.
     channel_targets: HashMap<String, u32>,
-    /// Channels with auto-failover turned off: they route only to their chosen
-    /// device (or the exact default) and stay silent when it's gone. Absence
-    /// (the default) means failover is on.
+    /// Channels with auto-failover off: route only to their chosen device and
+    /// stay silent when it's gone. Absence means failover is on.
     channel_strict: std::collections::HashSet<String>,
-    /// Phase 3 mic chain.
     mic_config: MicConfig,
     /// Proxy for the sink_mic virtual source (kept alive while enabled).
     mic_source: Option<Node>,
     /// Mic-node removals we caused ourselves (a rename recreates the node), so
-    /// the heal path can tell them from an external destroy and only recreate
-    /// for the latter.
+    /// the heal path only recreates for an external destroy.
     mic_expected_removals: u32,
     mic_streams: Option<MicStreams>,
     levels: Option<Arc<LevelStore>>,
+    /// Wakes the route enforcer when a stream's facts complete.
+    stream_wake: Option<mpsc::SyncSender<()>>,
     /// Mix buses we own: node name -> proxy.
     bus_sources: HashMap<String, Node>,
     /// Bus node name -> member channel sink names.
@@ -171,18 +275,22 @@ struct State {
     monitor_links: HashMap<String, LinkSet>,
     /// Links from the mic playback stream into the virtual mic.
     mic_links: LinkSet,
+    /// Kept apart from `nodes`, which never mirrors internal streams.
+    engine_output: Option<u32>,
+    engine_links: LinkSet,
+    /// The engine died; the chain stays on Light until the user re-picks
+    /// Strong, so a plugin that can't keep up doesn't crash-loop.
+    engine_failed: bool,
+    /// For the engine watcher thread to report back into this loop.
+    self_tx: Option<pw::channel::Sender<Cmd>>,
     /// Per-channel EQ configs (source of truth for chain (re)creation -
     /// kept even while disabled so re-enabling restores the bands).
     eq_configs: HashMap<String, EqConfig>,
-    /// Live EQ inserts by channel sink name. Presence here *is* "EQ is
-    /// enabled and live"; the channel's outgoing links re-source from the
-    /// insert's playback node.
+    /// Live EQ inserts by channel sink name. Presence *is* "EQ enabled and
+    /// live" - the channel's outgoing links then re-source from the insert.
     eq_streams: HashMap<String, EqChainHandle>,
-    /// EQ playback node id -> node ids it is allowed to feed. Rebuilt
-    /// wholesale by every `ensure_all_links` pass (send-gain insert legs
-    /// included, not just EQ); the link police destroys
-    /// anything else (WirePlumber routes playback streams to the default
-    /// sink - same leak the mic police exists for).
+    /// EQ playback node id -> node ids it may feed. The link police destroys
+    /// anything else, since WirePlumber routes playback to the default sink.
     eq_desired_targets: HashMap<u32, std::collections::HashSet<u32>>,
 }
 
@@ -203,11 +311,17 @@ impl State {
             .map(|h| h.playback_node_id())
             .filter(|id| *id != u32::MAX)
     }
+
+    /// Request a routing pass; a pending wake already covers this one.
+    fn wake_router(&self) {
+        if let Some(wake) = &self.stream_wake {
+            let _ = wake.try_send(());
+        }
+    }
 }
 
-/// The node whose ports feed a channel's downstream links: the EQ insert's
-/// playback stream when one is live, otherwise the channel sink itself.
-/// Pure so the routing decision is unit-testable (like `resolve_target`).
+/// Node whose ports feed a channel's downstream links: the EQ insert's
+/// playback stream when live, else the channel sink. Pure for testability.
 fn resolve_source(eq_playback: Option<u32>, channel_id: u32) -> u32 {
     eq_playback.unwrap_or(channel_id)
 }
@@ -228,9 +342,8 @@ impl State {
     }
 }
 
-// The CoreRc is needed by the command handler (object creation/destruction);
-// this thread owns all PipeWire objects, so a thread-local is the simplest
-// way to share it across the listener closures.
+// Needed by the command handler for object creation/destruction; a
+// thread-local is the simplest way to share it across listener closures.
 thread_local! {
     static CORE: RefCell<Option<CoreRc>> = const { RefCell::new(None) };
 }
@@ -239,18 +352,22 @@ thread_local! {
 /// `init_tx` reports startup success/failure exactly once.
 pub fn run(
     receiver: pw::channel::Receiver<Cmd>,
+    self_tx: pw::channel::Sender<Cmd>,
     init_tx: mpsc::Sender<Result<(), SinkError>>,
     levels: Arc<LevelStore>,
+    stream_wake: mpsc::SyncSender<()>,
 ) {
-    if let Err(e) = setup_and_run(receiver, &init_tx, levels) {
+    if let Err(e) = setup_and_run(receiver, self_tx, &init_tx, levels, stream_wake) {
         let _ = init_tx.send(Err(e));
     }
 }
 
 fn setup_and_run(
     receiver: pw::channel::Receiver<Cmd>,
+    self_tx: pw::channel::Sender<Cmd>,
     init_tx: &mpsc::Sender<Result<(), SinkError>>,
     levels: Arc<LevelStore>,
+    stream_wake: mpsc::SyncSender<()>,
 ) -> Result<(), SinkError> {
     pw::init();
     let err = |stage: &str, e: pw::Error| SinkError::Config(format!("pipewire {stage}: {e}"));
@@ -264,6 +381,8 @@ fn setup_and_run(
 
     let state = Rc::new(RefCell::new(State {
         levels: Some(levels.clone()),
+        self_tx: Some(self_tx),
+        stream_wake: Some(stream_wake),
         ..State::default()
     }));
 
@@ -283,12 +402,17 @@ fn setup_and_run(
                 enum Heal {
                     Nothing,
                     Relink,
-                    Recreate(String, String, u8),
+                    Recreate(String, String, NodeKind),
                 }
                 let heal = {
                     let mut s = state.borrow_mut();
                     s.links.remove(&id);
                     s.ports.remove(&id);
+                    s.clients.remove(&id);
+                    if s.engine_output == Some(id) {
+                        s.engine_output = None;
+                        s.engine_links.clear();
+                    }
                     let Some(node) = s.nodes.remove(&id) else {
                         return;
                     };
@@ -297,51 +421,50 @@ fn setup_and_run(
                         s.meters.remove(&name);
                         s.adopted_sinks.remove(&name);
                     }
+                    // The mic chain's device left. Drop the chain so it
+                    // rebuilds instead of running on a corpse.
+                    if is_capture_class(&node.media_class)
+                        && s.mic_config.input_device.as_deref() == Some(name.as_str())
+                    {
+                        s.mic_streams = None;
+                    }
                     match s.desired.get(&name).cloned() {
                         Some((label, kind)) => {
                             // Drop any dangling proxy so the heal isn't
                             // blocked by a corpse.
                             match kind {
-                                0 => {
+                                NodeKind::Channel => {
                                     s.owned_sinks.remove(&name);
                                 }
-                                1 => {
+                                NodeKind::MixSource | NodeKind::MixSink => {
                                     s.bus_sources.remove(&name);
                                 }
-                                _ => {}
+                                NodeKind::Mic => {}
                             }
-                            // A deliberate recreate (mic rename) already has
-                            // a fresh proxy/node - don't double up. For the
-                            // mic the new proxy is set synchronously before
-                            // this removal event, so `mic_source.is_some()`
-                            // can't tell our own destroy from an external one;
-                            // the expected-removals counter can.
+                            // Proxy is replaced before this event fires, so
+                            // `is_some()` can't tell recreate from destroy.
                             let already_back = match kind {
-                                2 => {
+                                NodeKind::Mic => {
                                     if s.mic_expected_removals > 0 {
                                         s.mic_expected_removals -= 1;
                                         true
                                     } else {
-                                        // External destroy (wpctl, a session
-                                        // hiccup): drop the dead proxy so the
-                                        // recreate below isn't blocked by it.
+                                        // External destroy: drop the dead proxy
+                                        // so the recreate isn't blocked.
                                         s.mic_source = None;
                                         false
                                     }
                                 }
-                                _ => s.node_by_name(&name).is_some(),
+                                NodeKind::Channel | NodeKind::MixSource | NodeKind::MixSink => {
+                                    s.node_by_name(&name).is_some()
+                                }
                             };
                             if already_back {
                                 Heal::Relink
                             } else {
                                 s.meters.remove(&name);
-                                // The insert captures from a fixed node id
-                                // and never reconnects, so it is dead once
-                                // the sink is. Dropping it here lets the
-                                // rebuild hook in `on_node` fire against the
-                                // recreated sink; leaving it would keep
-                                // `resolve_source` routing the channel
-                                // through a stream with no input.
+                                // The insert never reconnects, so it must be
+                                // dropped for the rebuild hook in `on_node`.
                                 s.eq_streams.remove(&name);
                                 Heal::Recreate(name, label, kind)
                             }
@@ -360,13 +483,13 @@ fn setup_and_run(
                                 Ok(proxy) => {
                                     let mut s = state.borrow_mut();
                                     match kind {
-                                        0 => {
+                                        NodeKind::Channel => {
                                             s.owned_sinks.insert(name, proxy);
                                         }
-                                        1 => {
+                                        NodeKind::MixSource | NodeKind::MixSink => {
                                             s.bus_sources.insert(name, proxy);
                                         }
-                                        _ => s.mic_source = Some(proxy),
+                                        NodeKind::Mic => s.mic_source = Some(proxy),
                                     }
                                 }
                                 Err(e) => eprintln!("sink: recreate {name} failed: {e}"),
@@ -406,6 +529,7 @@ fn on_global(
 ) {
     match global.type_ {
         ObjectType::Node => on_node(state, registry, core, levels, global),
+        ObjectType::Client => on_client(state, registry, global),
         ObjectType::Port => {
             let Some(props) = global.props else { return };
             let Some(node_id) = props.get("node.id").and_then(|v| v.parse().ok()) else {
@@ -418,9 +542,8 @@ fn on_global(
                 channel: props.get("audio.channel").map(str::to_string),
             };
             state.borrow_mut().ports.insert(global.id, entry);
-            // Channel and mic wiring both depend on ports of untracked
-            // stream nodes (EQ/mic playback streams), so reconcile on every
-            // port event - both are idempotent no-ops until both ends exist.
+            // Channel and mic wiring depend on ports of untracked stream nodes,
+            // so reconcile every port event; both are no-ops until ready.
             ensure_all_links(state);
             ensure_mic_links(state);
         }
@@ -432,46 +555,36 @@ fn on_global(
                 let police = {
                     let mut s = state.borrow_mut();
                     s.links.insert(global.id, (out, inp));
-                    // Police the mic playback stream: if anything (e.g. a
-                    // session-manager fallback) links it somewhere other
-                    // than the virtual mic, destroy that link - mic audio
-                    // must never leak into the speakers.
+                    // Police the mic playback stream: destroy links not to the
+                    // virtual mic, so mic audio never leaks out.
                     let mic_stray = match (s.mic_playback_node(), s.node_by_name(MIC_NODE)) {
-                        (Some(playback), mic) if out == playback => {
-                            mic.map(|n| n.id) != Some(inp)
-                        }
+                        (Some(playback), mic) if out == playback => mic.map(|n| n.id) != Some(inp),
                         _ => false,
                     };
-                    // Same policing for EQ playback streams: only the links
-                    // the loop planned (device/buses/monitor) may exist. An
-                    // EQ node with no plan yet (chain just built, first
-                    // reconcile pending) allows nothing - our own links are
-                    // always created after the plan is recorded.
-                    let eq_stray = s
-                        .eq_streams
-                        .values()
-                        .any(|h| h.playback_node_id() == out)
+                    // Same policing for EQ playback: only planned links may
+                    // exist - a node with no plan yet allows nothing.
+                    let eq_stray = s.eq_streams.values().any(|h| h.playback_node_id() == out)
                         && !s
                             .eq_desired_targets
                             .get(&out)
                             .is_some_and(|allowed| allowed.contains(&inp));
-                    // Send-gain inserts are policed the same way, on both
-                    // ends: the playback stream may only feed its planned
-                    // bus (or gained mic/channel audio leaks to the default
-                    // output), and the capture stream may only be fed by
-                    // its planned member source.
+                    // Send-gain inserts are policed on both ends too: an
+                    // unplanned link could leak gained audio to output.
                     let allowed = |out: u32, inp: u32| {
                         s.eq_desired_targets
                             .get(&out)
                             .is_some_and(|allowed| allowed.contains(&inp))
                     };
-                    let send_stray = (s
-                        .send_gains
-                        .values()
-                        .any(|h| h.playback_node_id() == out)
+                    let send_stray = (s.send_gains.values().any(|h| h.playback_node_id() == out)
                         || s.send_gains.values().any(|h| h.capture_node_id() == inp))
                         && !allowed(out, inp);
-                    mic_stray || eq_stray || send_stray
+                    let engine_stray = engine_link_stray(
+                        s.engine_output,
+                        s.mic_streams.as_ref().map(MicStreams::capture_node_id),
+                        out,
+                        inp,
+                    );
+                    mic_stray || eq_stray || send_stray || engine_stray
                 };
                 if police {
                     let _ = registry.destroy_global(global.id);
@@ -520,8 +633,7 @@ fn on_global(
                             let changed = s.default_source_name != name;
                             s.default_source_name = name;
                             // A follow-default mic chain is pinned to the
-                            // resolved device (dont-reconnect), so it
-                            // tracks default changes by rebuilding.
+                            // device, so it tracks changes by rebuilding.
                             changed
                                 && s.mic_config.enabled
                                 && s.mic_config.input_device.is_none()
@@ -543,6 +655,47 @@ fn on_global(
     }
 }
 
+fn on_client(state: &Rc<RefCell<State>>, registry: &RegistryRc, global: &GlobalObject<&DictRef>) {
+    let Ok(proxy) = registry.bind::<pw::client::Client, _>(global) else {
+        return;
+    };
+    let props: HashMap<String, String> = global
+        .props
+        .map(|d| {
+            d.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    // The full dict (sec.pid, portal app id) only arrives with the info event.
+    let state_i = state.clone();
+    let client_id = global.id;
+    let listener = proxy
+        .add_listener_local()
+        .info(move |info| {
+            let mut s = state_i.borrow_mut();
+            if let (Some(entry), Some(props)) = (s.clients.get_mut(&client_id), info.props()) {
+                for (k, v) in props.iter() {
+                    entry.props.insert(k.to_string(), v.to_string());
+                }
+                if !entry.settled {
+                    entry.settled = true;
+                    s.wake_router();
+                }
+            }
+        })
+        .register();
+    state.borrow_mut().clients.insert(
+        global.id,
+        ClientEntry {
+            props,
+            settled: false,
+            _proxy: proxy,
+            _listener: listener,
+        },
+    );
+}
+
 fn on_node(
     state: &Rc<RefCell<State>>,
     registry: &RegistryRc,
@@ -551,6 +704,11 @@ fn on_node(
     global: &GlobalObject<&DictRef>,
 ) {
     let Some(dict) = global.props else { return };
+    if dict.get("node.name") == Some(deepfilter::OUTPUT_NAME) {
+        state.borrow_mut().engine_output = Some(global.id);
+        ensure_mic_links(state);
+        return;
+    }
     let media_class = dict.get("media.class").unwrap_or_default().to_string();
     if media_class != STREAM_CLASS
         && media_class != SINK_CLASS
@@ -583,15 +741,21 @@ fn on_node(
         .info(move |info| {
             let running = matches!(info.state(), pw::node::NodeState::Running);
             let mut s = state_i.borrow_mut();
-            if let Some(entry) = s.nodes.get_mut(&node_id) {
-                entry.active = running;
-                // Registry globals only carry an abbreviated prop set; the
-                // info event has the full dict (e.g. application.process.
-                // binary, needed to name Discord's "WEBRTC VoiceEngine").
-                if let Some(props) = info.props() {
-                    for (k, v) in props.iter() {
-                        entry.props.insert(k.to_string(), v.to_string());
-                    }
+            let Some(entry) = s.nodes.get_mut(&node_id) else {
+                return;
+            };
+            entry.active = running;
+            // Registry globals carry only an abbreviated prop set; the info
+            // event has the full dict.
+            if let Some(props) = info.props() {
+                for (k, v) in props.iter() {
+                    entry.props.insert(k.to_string(), v.to_string());
+                }
+            }
+            if !entry.described {
+                entry.described = true;
+                if entry.media_class == STREAM_CLASS {
+                    s.wake_router();
                 }
             }
         })
@@ -628,14 +792,13 @@ fn on_node(
         channels: 2,
         muted: false,
         active: false,
+        described: false,
     };
 
     let mut s = state.borrow_mut();
     s.nodes.insert(global.id, entry);
 
     if media_class == SINK_CLASS && is_virtual_sink(&node_name) {
-        // A virtual sink came up: resolve pending create requests, remember
-        // it for teardown if we didn't create it, and attach a level meter.
         if let Some(waiters) = s.pending_creates.remove(&node_name) {
             for reply in waiters {
                 let _ = reply.send(Ok(()));
@@ -652,10 +815,8 @@ fn on_node(
                 Err(e) => eprintln!("sink: meter for {node_name} failed: {e}"),
             }
         }
-        // An enabled EQ config with no live insert: build it against the
-        // fresh sink id. Covers both startup (config loaded before the sink
-        // exists) and the heal path (sink recreated after an external
-        // destroy) with the same hook - like the meter above.
+        // An enabled EQ config with no live insert: build it against the fresh
+        // sink id. Covers both startup and the heal path with the same hook.
         if !s.eq_streams.contains_key(&node_name) {
             if let Some(config) = s.eq_configs.get(&node_name).filter(|c| c.enabled).cloned() {
                 match EqChainHandle::new(core, &node_name, global.id, &config) {
@@ -671,8 +832,6 @@ fn on_node(
         return;
     }
 
-    // The virtual mic source came up: attach the DSP streams and link it
-    // into any mix that carries the mic.
     if media_class == VIRTUAL_SOURCE_CLASS && node_name == MIC_NODE {
         drop(s);
         build_mic_streams(state);
@@ -680,10 +839,13 @@ fn on_node(
         return;
     }
 
-    // A mix bus came up: meter it (direct source capture) and link members.
-    if media_class == VIRTUAL_SOURCE_CLASS && is_bus_name(&node_name) {
+    // A mix in the playback list has no source of its own to meter, so it
+    // is metered through its monitor, like a channel.
+    if (media_class == VIRTUAL_SOURCE_CLASS || media_class == SINK_CLASS) && is_bus_name(&node_name)
+    {
+        let from_monitor = media_class == SINK_CLASS;
         if !s.meters.contains_key(&node_name) {
-            match MeterHandle::new(core, &node_name, global.id, levels.clone(), false) {
+            match MeterHandle::new(core, &node_name, global.id, levels.clone(), from_monitor) {
                 Ok(meter) => {
                     s.meters.insert(node_name.clone(), meter);
                 }
@@ -695,11 +857,30 @@ fn on_node(
         return;
     }
 
+    // A chain waiting for its device: plugged in now, or installed by a
+    // tool that starts after we do.
+    if s.mic_streams.is_none()
+        && s.mic_config.enabled
+        && s.mic_config.input_device.as_deref() == Some(node_name.as_str())
+        && is_capture_class(&media_class)
+    {
+        drop(s);
+        build_mic_streams(state);
+        ensure_all_links(state);
+        return;
+    }
+
     drop(s);
     // A new hardware sink may be the (returning) target of a channel.
     if media_class == SINK_CLASS {
         ensure_all_links(state);
     }
+}
+
+/// Both classes: a noise suppressor publishes its cleaned-up mic as a
+/// virtual source, not a real device, and the chain can capture either.
+fn is_capture_class(media_class: &str) -> bool {
+    media_class == SOURCE_CLASS || media_class == VIRTUAL_SOURCE_CLASS
 }
 
 /// (Re)build the mic capture/DSP/playback streams. The loop links the
@@ -712,24 +893,128 @@ fn build_mic_streams(state: &Rc<RefCell<State>>) {
     if !s.mic_config.enabled {
         return;
     }
-    // Resolve "follow default" to the actual hardware source at build
-    // time - the capture must be pinned (and must never point at our own
-    // virtual mic, or the chain would eat its own output).
+    // Targeting a device that isn't here yet would get the capture connected to
+    // something else and pinned there; wait for `on_node` to build it instead.
+    if let Some(pinned) = &s.mic_config.input_device {
+        if !s
+            .nodes
+            .values()
+            .any(|n| n.props.get("node.name") == Some(pinned) && is_capture_class(&n.media_class))
+        {
+            eprintln!("sink: mic chain waiting for {pinned}");
+            return;
+        }
+    }
+    // Resolve "follow default" to the hardware source: the capture must never
+    // point at our own virtual mic, or the chain would eat its output.
     let mic_target = s.mic_config.input_device.clone().or_else(|| {
         s.default_source_name
             .clone()
             .filter(|name| name != MIC_NODE)
     });
-    let Some(levels) = s.levels.clone() else { return };
-    match MicStreams::new(&core, &s.mic_config, mic_target.as_deref(), levels) {
+    let Some(levels) = s.levels.clone() else {
+        return;
+    };
+    // Stop the old engine before starting another on the same mic.
+    s.mic_streams = None;
+    let engine = start_engine(&mut s, mic_target.as_deref());
+    match MicStreams::new(&core, &s.mic_config, mic_target.as_deref(), levels, engine) {
         Ok(streams) => {
             s.mic_links.clear();
+            s.engine_links.clear();
             s.mic_streams = Some(streams);
         }
         Err(e) => eprintln!("sink: mic chain failed: {e}"),
     }
     drop(s);
     ensure_mic_links(state);
+}
+
+#[derive(Debug, PartialEq)]
+enum EnginePlan {
+    Skip,
+    /// It failed earlier: Light stands in until the user retries, so a plugin
+    /// that can't keep up never crash-loops.
+    Failed,
+    /// Selected but not installed: Light stands in.
+    Missing,
+    Spawn(std::path::PathBuf),
+}
+
+fn plan_engine(
+    mode: NoiseSuppression,
+    failed: bool,
+    find: impl FnOnce() -> Option<std::path::PathBuf>,
+) -> EnginePlan {
+    if mode != NoiseSuppression::Strong {
+        EnginePlan::Skip
+    } else if failed {
+        EnginePlan::Failed
+    } else {
+        find().map_or(EnginePlan::Missing, EnginePlan::Spawn)
+    }
+}
+
+fn start_engine(s: &mut State, mic_target: Option<&str>) -> Option<EngineProcess> {
+    let EnginePlan::Spawn(plugin) =
+        plan_engine(s.mic_config.noise_suppression, s.engine_failed, || {
+            deepfilter::find().map(|(_, path)| path)
+        })
+    else {
+        return None;
+    };
+    let tx = s.self_tx.clone()?;
+    match EngineProcess::spawn(&plugin, mic_target, move |pid| {
+        let _ = tx.send(Cmd::EngineExited { pid });
+    }) {
+        Ok(engine) => Some(engine),
+        Err(e) => {
+            eprintln!("sink: {e}");
+            s.engine_failed = true;
+            None
+        }
+    }
+}
+
+/// Derived from the loop's own state on every query, so it can't go stale.
+fn engine_state(s: &State) -> EngineState {
+    if s.mic_config.noise_suppression != NoiseSuppression::Strong {
+        EngineState::Idle
+    } else if s
+        .mic_streams
+        .as_ref()
+        .and_then(MicStreams::engine_pid)
+        .is_some()
+    {
+        EngineState::Running
+    } else if s.engine_failed {
+        EngineState::Failed
+    } else if deepfilter::find().is_none() {
+        EngineState::Missing
+    } else {
+        // Picked and installed, but no chain to run it in (mic off, or
+        // waiting for its device).
+        EngineState::Idle
+    }
+}
+
+/// A noise suppression change that needs the chain rebuilt: Strong rewires
+/// the capture through another process, and a Strong that was standing in
+/// with Light starts for real once its plugin is installed.
+fn noise_needs_rebuild(
+    prev: NoiseSuppression,
+    next: NoiseSuppression,
+    engine_failed: bool,
+    light_fallback: bool,
+    plugin_present: impl FnOnce() -> bool,
+) -> bool {
+    let strong = NoiseSuppression::Strong;
+    (prev == strong) != (next == strong)
+        || (next == strong && !engine_failed && light_fallback && plugin_present())
+}
+
+fn engine_link_stray(engine_output: Option<u32>, capture: Option<u32>, out: u32, inp: u32) -> bool {
+    engine_output == Some(out) && capture != Some(inp)
 }
 
 /// Link the mic playback stream's output ports into the virtual mic.
@@ -739,6 +1024,7 @@ fn ensure_mic_links(state: &Rc<RefCell<State>>) {
         return;
     };
     let mut s = state.borrow_mut();
+    ensure_engine_links(&mut s, &core);
     let (Some(playback_id), Some(mic_node)) = (
         s.mic_playback_node(),
         s.node_by_name(MIC_NODE).map(|n| n.id),
@@ -754,9 +1040,26 @@ fn ensure_mic_links(state: &Rc<RefCell<State>>) {
     s.mic_links = create_links(&core, "mic", playback_id, mic_node, &pairs);
 }
 
+fn ensure_engine_links(s: &mut State, core: &CoreRc) {
+    let capture = s
+        .mic_streams
+        .as_ref()
+        .filter(|m| m.engine_pid().is_some())
+        .map(MicStreams::capture_node_id)
+        .filter(|id| *id != u32::MAX);
+    let (Some(engine_out), Some(capture)) = (s.engine_output, capture) else {
+        return;
+    };
+    let pairs = desired_pairs(s, engine_out, capture);
+    let current: Vec<(u32, u32)> = s.engine_links.iter().map(|(o, i, _)| (*o, *i)).collect();
+    if current == pairs || pairs.is_empty() {
+        return;
+    }
+    s.engine_links = create_links(core, "noise suppression", engine_out, capture, &pairs);
+}
+
 /// Compute monitor→input port pairs from `channel_id`'s output ports to
-/// `target_id`'s input ports. Pairs by audio.channel where possible, with
-/// an index-wrap fallback for mono/odd channel maps.
+/// `target_id`'s input ports, by audio.channel with an index-wrap fallback.
 fn desired_pairs(s: &State, channel_id: u32, target_id: u32) -> Vec<(u32, u32)> {
     if channel_id == target_id {
         return Vec::new();
@@ -798,24 +1101,20 @@ fn desired_pairs(s: &State, channel_id: u32, target_id: u32) -> Vec<(u32, u32)> 
         .collect()
 }
 
-/// Highest-`priority.session` non-virtual sink from `(id, node.name, priority)`
-/// candidates. Pure (plain tuples) so the failover choice is unit-testable,
-/// and it reuses WirePlumber's own scoring so Sink's fallback matches the
-/// device the OS would pick, consistently across distros.
+/// Highest-`priority.session` non-virtual sink from the candidates - reuses
+/// WirePlumber's own scoring so the fallback matches the OS's pick.
 fn pick_fallback_sink<'a>(
     candidates: impl Iterator<Item = (u32, &'a str, i64)>,
     excluded: Option<&str>,
 ) -> Option<u32> {
     candidates
-        .filter(|(_, name, _)| !is_virtual_sink(name) && excluded != Some(*name))
+        .filter(|(_, name, _)| !is_own_sink(name) && excluded != Some(*name))
         .max_by_key(|&(_, _, priority)| priority)
         .map(|(id, _, _)| id)
 }
 
-/// The real output sink to fall back to when a follow-default channel's
-/// default has no live node - e.g. the device was unplugged and WirePlumber
-/// hasn't reassigned the default. Without it such a channel gets no links and
-/// goes silent (the field-reported "no audio on speakers when headset off").
+/// The real output sink to fall back to when a follow-default channel's default
+/// has no live node (e.g. device unplugged, WirePlumber hasn't reassigned yet).
 fn fallback_sink(s: &State) -> Option<u32> {
     pick_fallback_sink(
         s.nodes
@@ -835,12 +1134,29 @@ fn fallback_sink(s: &State) -> Option<u32> {
     )
 }
 
-/// Which device a channel routes to. `explicit_id` is the pinned device's node
-/// id when it's set *and* present; `pinned` is whether a device is pinned at
-/// all; `strict` is failover-off. Follow-default and pinned-but-gone channels
-/// take the default, then - only when failover is on - the best available
-/// sink; in strict mode a gone device resolves to nothing (silence) rather than
-/// jumping elsewhere. Pure, so the whole matrix is unit-testable.
+/// The system default sink's node, unless it is one of ours: a user can make
+/// a channel the default, and following it would loop channel/EQ audio back,
+/// so that counts as "no default".
+fn real_default(default_sink_name: Option<&str>, node_ids: &HashMap<String, u32>) -> Option<u32> {
+    default_sink_name
+        .filter(|name| !is_own_sink(name))
+        .and_then(|name| node_ids.get(name))
+        .copied()
+}
+
+/// Where listening (monitoring) plays: the real default, else the device
+/// follow-default channels fail over to. Without the fallback, making a
+/// channel the default would silently mute every monitor.
+fn listen_target(
+    default_sink_name: Option<&str>,
+    node_ids: &HashMap<String, u32>,
+    fallback: Option<u32>,
+) -> Option<u32> {
+    real_default(default_sink_name, node_ids).or(fallback)
+}
+
+/// Which device a channel routes to: explicit pin wins, then default, then the
+/// best available sink; strict + gone device = silence.
 fn resolve_target(
     explicit_id: Option<u32>,
     pinned: bool,
@@ -893,17 +1209,21 @@ struct MemberLink<'a> {
     included: bool,
 }
 
-/// Route one member into one bus: a direct link at unity (the default -
-/// zero extra latency/CPU), or through a lazily-created gain insert when
-/// that mix's send level is off 100%. Every planned leg is registered in
-/// `eq_targets` so the link police allows it and destroys anything else.
+/// Route one member into one bus: a direct link at unity, or a gain insert when
+/// off 100%. Every planned leg is registered in `eq_targets` for policing.
 fn reconcile_bus_member(
     core: &CoreRc,
     s: &mut State,
     link: MemberLink,
     eq_targets: &mut HashMap<u32, std::collections::HashSet<u32>>,
 ) {
-    let MemberLink { bus_name, bus_id, member, source_id, included } = link;
+    let MemberLink {
+        bus_name,
+        bus_id,
+        member,
+        source_id,
+        included,
+    } = link;
     let key = (bus_name.to_string(), member.to_string());
     let gain = s.bus_member_gains.get(&key).copied().unwrap_or(100);
 
@@ -970,10 +1290,8 @@ fn reconcile_bus_member(
     }
 
     eq_targets.entry(source_id).or_default().insert(capture_id);
-    // The playback leg must be in the plan too: the link police destroys
-    // any link off an insert's playback stream that isn't planned, which
-    // is what stops WirePlumber's default-sink routing from leaking this
-    // (gained, possibly mic) audio to the user's own output.
+    // The playback leg must be planned, or the link police can't stop
+    // WirePlumber from leaking this audio to the user's output.
     eq_targets.entry(playback_id).or_default().insert(bus_id);
 
     // ---- member source -> gain capture ----
@@ -1011,12 +1329,8 @@ fn reconcile_bus_member(
     }
 }
 
-/// Reconcile loopback links for every virtual channel:
-/// - monitor → chosen output device (or the system default when unset /
-///   the chosen device is gone - automatic failover)
-/// - monitor → Stream Mix source (Phase 5, for OBS capture)
-///
-/// Idempotent - existing correct links are left untouched.
+/// Reconcile loopback links for every virtual channel: monitor -> chosen output
+/// device (failover to default) and monitor -> Stream Mix. Idempotent.
 fn ensure_all_links(state: &Rc<RefCell<State>>) {
     let Some(core) = CORE.with(|c| c.borrow().clone()) else {
         return;
@@ -1044,16 +1358,15 @@ fn ensure_all_links(state: &Rc<RefCell<State>>) {
         .cloned()
         .collect();
 
-    // Where follow-default channels go when their default has no live node
-    // (unplugged, WirePlumber slow/unwilling to reassign): the best available
-    // real sink, so audio fails over instead of dropping to silence.
+    // Where follow-default channels go when their default has no live node: the
+    // best available sink, so audio fails over instead of going silent.
     let fallback = fallback_sink(&s);
     // Forget resolved targets for channels that no longer exist.
-    s.channel_targets.retain(|name, _| channel_names.contains(name));
+    s.channel_targets
+        .retain(|name, _| channel_names.contains(name));
 
-    // The link plan for every live EQ insert, rebuilt from scratch each
-    // pass - the link police destroys anything an EQ playback node feeds
-    // that isn't in here.
+    // The link plan for every live EQ insert, rebuilt each pass - the link
+    // police destroys anything an EQ playback node feeds that isn't in here.
     let mut eq_targets: HashMap<u32, std::collections::HashSet<u32>> = HashMap::new();
 
     for sink_name in &channel_names {
@@ -1062,27 +1375,18 @@ fn ensure_all_links(state: &Rc<RefCell<State>>) {
             Some(id) => *id,
             None => continue,
         };
-        // With a live EQ insert, every outgoing link (device, buses,
-        // monitor) re-sources from its playback node - one coherent source,
-        // so all listeners hear the same (EQ'd, equally delayed) audio.
+        // With a live EQ insert, every link re-sources from its playback node,
+        // so listeners hear the same (EQ'd, equally delayed) audio.
         let source_id = resolve_source(s.eq_playback_node(sink_name), channel_id);
 
         // ---- output device links ----
         let explicit = s.channel_outputs.get(sink_name).cloned().flatten();
         let pinned = explicit.is_some();
-        let explicit_id = explicit.as_deref().and_then(|name| node_ids.get(name).copied());
+        let explicit_id = explicit
+            .as_deref()
+            .and_then(|name| node_ids.get(name).copied());
         let strict = s.channel_strict.contains(sink_name);
-        // A user can make one of our channels the system default; following
-        // it would loop every follow-default channel (and the channel's own
-        // EQ playback) back into it. Treat that as "no default" so the real
-        // device fallback applies - pick_fallback_sink never picks a
-        // virtual sink.
-        let default_id = s
-            .default_sink_name
-            .as_ref()
-            .filter(|name| !is_virtual_sink(name))
-            .and_then(|name| node_ids.get(name))
-            .copied();
+        let default_id = real_default(s.default_sink_name.as_deref(), &node_ids);
         let target_id = resolve_target(explicit_id, pinned, strict, default_id, fallback);
         // Record where this channel resolves to (even when the link set is
         // unchanged) so the UI reflects the live target, including failover.
@@ -1127,7 +1431,13 @@ fn ensure_all_links(state: &Rc<RefCell<State>>) {
             reconcile_bus_member(
                 &core,
                 &mut s,
-                MemberLink { bus_name, bus_id: *bus_id, member: sink_name, source_id, included },
+                MemberLink {
+                    bus_name,
+                    bus_id: *bus_id,
+                    member: sink_name,
+                    source_id,
+                    included,
+                },
                 &mut eq_targets,
             );
         }
@@ -1153,14 +1463,7 @@ fn ensure_all_links(state: &Rc<RefCell<State>>) {
     }
 
     // ---- monitor links (listen on the default output, session scoped) ----
-    // Same virtual-default guard as the channel links above: never treat
-    // one of our own channels as the listening device.
-    let default_id = s
-        .default_sink_name
-        .as_ref()
-        .filter(|name| !is_virtual_sink(name))
-        .and_then(|name| node_ids.get(name))
-        .copied();
+    let default_id = listen_target(s.default_sink_name.as_deref(), &node_ids, fallback);
     let monitored: Vec<String> = s.monitored.iter().cloned().collect();
     for name in monitored {
         // Monitoring an EQ'd channel listens to the insert's output - the
@@ -1209,28 +1512,64 @@ fn ensure_all_links(state: &Rc<RefCell<State>>) {
     s.eq_desired_targets = eq_targets;
 }
 
-fn node_needs_monitor_volumes(kind: u8) -> bool {
-    kind == 0 || kind == 1
+/// A node Sink creates and keeps alive. A mix comes in two shapes based on
+/// which device list the user put it in; the rest of the loop asks `is_mix`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeKind {
+    Channel,
+    MixSource,
+    MixSink,
+    Mic,
 }
 
-/// The three virtual node shapes we own (kind 0=channel sink, 1=mix bus,
-/// 2=virtual mic). The heal path mirrors the create handlers with this.
+impl NodeKind {
+    fn mix(role: crate::persistence::buses::MixRole) -> Self {
+        if role.is_recording() {
+            Self::MixSource
+        } else {
+            Self::MixSink
+        }
+    }
+
+    fn is_mix(self) -> bool {
+        matches!(self, Self::MixSource | Self::MixSink)
+    }
+
+    fn media_class(self) -> &'static str {
+        match self {
+            Self::Channel | Self::MixSink => SINK_CLASS,
+            Self::MixSource | Self::Mic => VIRTUAL_SOURCE_CLASS,
+        }
+    }
+
+    fn audio_position(self) -> &'static str {
+        match self {
+            Self::Mic => "[ MONO ]",
+            _ => "[ FL FR ]",
+        }
+    }
+
+    /// Everything the user sets a level on needs its monitor to follow that
+    /// level; the mic chain sets its own gain upstream.
+    fn needs_monitor_volumes(self) -> bool {
+        !matches!(self, Self::Mic)
+    }
+}
+
 fn create_node_object(
     core: &CoreRc,
     name: &str,
     label: &str,
-    kind: u8,
+    kind: NodeKind,
 ) -> Result<Node, pw::Error> {
-    let class = if kind == 0 { SINK_CLASS } else { VIRTUAL_SOURCE_CLASS };
-    let position = if kind == 2 { "[ MONO ]" } else { "[ FL FR ]" };
     let mut props = pw::properties::properties! {
         "factory.name" => "support.null-audio-sink",
         "node.name" => name,
         "node.description" => label,
-        "media.class" => class,
-        "audio.position" => position,
+        "media.class" => kind.media_class(),
+        "audio.position" => kind.audio_position(),
     };
-    if node_needs_monitor_volumes(kind) {
+    if kind.needs_monitor_volumes() {
         props.insert("monitor.channel-volumes", "true");
     }
     core.create_object::<Node>("adapter", &props)
@@ -1238,12 +1577,37 @@ fn create_node_object(
 
 fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
     match cmd {
+        Cmd::EngineState { reply } => {
+            let _ = reply.send(Ok(engine_state(&state.borrow())));
+        }
+        Cmd::RetryEngine { reply } => {
+            let rebuild = {
+                let mut s = state.borrow_mut();
+                s.engine_failed = false;
+                s.mic_streams.is_some()
+            };
+            if rebuild {
+                build_mic_streams(state);
+            }
+            let _ = reply.send(Ok(()));
+        }
+        Cmd::EngineExited { pid } => {
+            let current = {
+                let s = state.borrow();
+                s.mic_streams.as_ref().and_then(MicStreams::engine_pid) == Some(pid)
+            };
+            if current {
+                eprintln!("sink: noise suppression engine exited; falling back to light");
+                state.borrow_mut().engine_failed = true;
+                build_mic_streams(state);
+            }
+        }
         Cmd::CreateSink { name, label, reply } => {
             let mut s = state.borrow_mut();
             if s.node_by_name(&name).is_some() {
                 // Already exists (e.g. leftover from a previous run) - the
                 // registry handler has adopted it. Still ours to keep alive.
-                s.desired.insert(name, (label, 0));
+                s.desired.insert(name, (label, NodeKind::Channel));
                 let _ = reply.send(Ok(()));
                 return;
             }
@@ -1272,7 +1636,7 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
                 // reply fires when the global appears in the registry.
                 Ok(proxy) => {
                     s.owned_sinks.insert(name.clone(), proxy);
-                    s.desired.insert(name.clone(), (label, 0));
+                    s.desired.insert(name.clone(), (label, NodeKind::Channel));
                     s.pending_creates.entry(name).or_default().push(reply);
                 }
                 Err(e) => {
@@ -1325,7 +1689,15 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
                 .map(|n| {
                     let (app_name, match_prop, match_value) =
                         crate::audio::types::resolve_identity(|key| n.props.get(key).cloned());
+                    let client = n
+                        .props
+                        .get("client.id")
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .map(|cid| s.clients.get(&cid).map(|c| (&c.props, c.settled)));
+                    let (props, settled) = stream_facts(&n.props, client);
                     AppStream {
+                        props,
+                        settled: settled && n.described,
                         index: n.id,
                         serial: n.serial.unwrap_or_else(|| u64::from(n.id)),
                         app_name,
@@ -1356,12 +1728,14 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
             let outputs = s
                 .nodes
                 .values()
+                // Where a channel may be sent: real devices only. One of
+                // our own nodes would feed itself.
                 .filter(|n| {
                     n.media_class == SINK_CLASS
                         && !n
                             .props
                             .get("node.name")
-                            .is_some_and(|name| is_virtual_sink(name))
+                            .is_some_and(|name| is_own_sink(name))
                 })
                 .map(|n| OutputDevice {
                     index: n.id,
@@ -1416,7 +1790,11 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
             .cloned();
             let _ = reply.send(Ok(preferred));
         }
-        Cmd::SetNodeVolumeByName { name, percent, reply } => {
+        Cmd::SetNodeVolumeByName {
+            name,
+            percent,
+            reply,
+        } => {
             let s = state.borrow();
             let _ = reply.send(set_props(s.node_by_name(&name), Some(percent), None));
         }
@@ -1428,10 +1806,16 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
             let s = state.borrow();
             let _ = reply.send(set_props(s.nodes.get(&id), Some(percent), None));
         }
-        Cmd::CreateBus { name, label, reply } => {
+        Cmd::CreateBus {
+            name,
+            label,
+            role,
+            reply,
+        } => {
+            let kind = NodeKind::mix(role);
             let mut s = state.borrow_mut();
             if s.bus_sources.contains_key(&name) || s.node_by_name(&name).is_some() {
-                s.desired.insert(name, (label, 1)); // adopted - keep alive
+                s.desired.insert(name, (label, kind)); // adopted - keep alive
                 let _ = reply.send(Ok(()));
                 return;
             }
@@ -1439,9 +1823,9 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
                 let _ = reply.send(Err(SinkError::Config("core is gone".into())));
                 return;
             };
-            match create_node_object(&core, &name, &label, 1) {
+            match create_node_object(&core, &name, &label, kind) {
                 Ok(proxy) => {
-                    s.desired.insert(name.clone(), (label, 1));
+                    s.desired.insert(name.clone(), (label, kind));
                     s.bus_sources.insert(name, proxy);
                     let _ = reply.send(Ok(()));
                 }
@@ -1471,7 +1855,11 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
             }
             let _ = reply.send(Ok(()));
         }
-        Cmd::SetBusMembers { name, channels, reply } => {
+        Cmd::SetBusMembers {
+            name,
+            channels,
+            reply,
+        } => {
             state
                 .borrow_mut()
                 .bus_members
@@ -1482,11 +1870,9 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
         Cmd::SetBusMic { name, mic, reply } => {
             {
                 let mut s = state.borrow_mut();
-                // The command layer validates against the definition set,
-                // but a deletion can race this queue: DestroyBus may land
-                // between that check and here, and a stale insert would be
-                // inherited by a same-named mix created later.
-                if !s.desired.get(&name).is_some_and(|(_, kind)| *kind == 1) {
+                // A deletion can race this queue: DestroyBus may land between
+                // the check and here, so re-check the loop's live state.
+                if !s.desired.get(&name).is_some_and(|(_, kind)| kind.is_mix()) {
                     let _ = reply.send(Err(SinkError::UnknownSink(name)));
                     return;
                 }
@@ -1499,15 +1885,25 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
             ensure_all_links(state);
             let _ = reply.send(Ok(()));
         }
-        Cmd::SetBusMemberGain { bus_name, member, percent, reply } => {
+        Cmd::SetBusMemberGain {
+            bus_name,
+            member,
+            percent,
+            reply,
+        } => {
             let percent = percent.min(150);
             {
                 let mut s = state.borrow_mut();
                 // Same deletion race as SetBusMic: re-check both names
                 // against the loop's own live state before storing.
-                let bus_live = s.desired.get(&bus_name).is_some_and(|(_, kind)| *kind == 1);
+                let bus_live = s
+                    .desired
+                    .get(&bus_name)
+                    .is_some_and(|(_, kind)| kind.is_mix());
                 let member_live = member == MIC_NODE
-                    || s.desired.get(&member).is_some_and(|(_, kind)| *kind == 0);
+                    || s.desired
+                        .get(&member)
+                        .is_some_and(|(_, kind)| *kind == NodeKind::Channel);
                 if !bus_live || !member_live {
                     let _ = reply.send(Err(SinkError::UnknownSink(bus_name)));
                     return;
@@ -1528,7 +1924,11 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
             ensure_all_links(state);
             let _ = reply.send(Ok(()));
         }
-        Cmd::SetMonitor { name, enabled, reply } => {
+        Cmd::SetMonitor {
+            name,
+            enabled,
+            reply,
+        } => {
             {
                 let mut s = state.borrow_mut();
                 if enabled {
@@ -1541,7 +1941,11 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
             ensure_all_links(state);
             let _ = reply.send(Ok(()));
         }
-        Cmd::SetChannelEq { sink_name, config, reply } => {
+        Cmd::SetChannelEq {
+            sink_name,
+            config,
+            reply,
+        } => {
             if !is_virtual_sink(&sink_name) {
                 let _ = reply.send(Err(SinkError::UnknownSink(sink_name)));
                 return;
@@ -1560,10 +1964,7 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
             if needs_destroy {
                 state.borrow_mut().eq_streams.remove(&sink_name);
             } else if needs_create {
-                let sink_id = state
-                    .borrow()
-                    .node_by_name(&sink_name)
-                    .map(|n| n.id);
+                let sink_id = state.borrow().node_by_name(&sink_name).map(|n| n.id);
                 if let Some(sink_id) = sink_id {
                     let Some(core) = CORE.with(|c| c.borrow().clone()) else {
                         let _ = reply.send(Err(SinkError::Config(
@@ -1573,7 +1974,10 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
                     };
                     match EqChainHandle::new(&core, &sink_name, sink_id, &config) {
                         Ok(handle) => {
-                            state.borrow_mut().eq_streams.insert(sink_name.clone(), handle);
+                            state
+                                .borrow_mut()
+                                .eq_streams
+                                .insert(sink_name.clone(), handle);
                         }
                         Err(e) => {
                             let _ = reply.send(Err(e));
@@ -1596,7 +2000,11 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
 
                 // Live-tunable params apply without a rebuild.
                 if let Some(streams) = &s.mic_streams {
-                    streams.params.apply(&config);
+                    streams.params.apply(&config, streams.light_fallback);
+                }
+                // Picking a mode again is the retry after an engine failure.
+                if prev.noise_suppression != config.noise_suppression {
+                    s.engine_failed = false;
                 }
 
                 // Renaming the published mic recreates the node so other
@@ -1606,9 +2014,8 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
                     && prev.output_label != config.output_label;
                 let mut orphaned: Vec<u32> = Vec::new();
                 if needs_recreate {
-                    // Remember who was capturing the mic (Discord, OBS …) -
-                    // destroying the node drops them onto the fallback
-                    // source, and they'd silently stay there.
+                    // Remember who was capturing the mic - destroying the node
+                    // drops them onto fallback, where they'd stay.
                     if let Some(mic) = s.node_by_name(MIC_NODE) {
                         let mic_id = mic.id;
                         orphaned = s
@@ -1616,22 +2023,24 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
                             .values()
                             .filter(|(out, _)| *out == mic_id)
                             .map(|(_, input)| *input)
-                            // Tracked nodes here are devices (monitor
-                            // targets) - foreign capture streams aren't in
-                            // the mirror.
+                            // Tracked nodes here are devices (monitor targets)
+                            // - foreign capture streams aren't in the mirror.
                             .filter(|input| !s.nodes.contains_key(input))
                             .collect();
                     }
                     s.mic_streams = None;
                     s.mic_links.clear();
-                    s.bus_links.retain(|(_, member), _| member.as_str() != MIC_NODE);
-                    s.send_gains.retain(|(_, member), _| member.as_str() != MIC_NODE);
-                    s.send_gain_in_links.retain(|(_, member), _| member.as_str() != MIC_NODE);
-                    s.send_gain_failed.retain(|(_, member)| member.as_str() != MIC_NODE);
+                    s.bus_links
+                        .retain(|(_, member), _| member.as_str() != MIC_NODE);
+                    s.send_gains
+                        .retain(|(_, member), _| member.as_str() != MIC_NODE);
+                    s.send_gain_in_links
+                        .retain(|(_, member), _| member.as_str() != MIC_NODE);
+                    s.send_gain_failed
+                        .retain(|(_, member)| member.as_str() != MIC_NODE);
                     if let Some(proxy) = s.mic_source.take() {
-                        // Our own destroy - the heal path should expect this
-                        // removal rather than treat it as external and race a
-                        // second recreate.
+                        // Our destroy - the heal path should expect it rather
+                        // than treat it as external and race a recreate.
                         s.mic_expected_removals += 1;
                         if let Some(core) = CORE.with(|c| c.borrow().clone()) {
                             let _ = core.destroy_object(proxy);
@@ -1642,10 +2051,24 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
                 let needs_create = config.enabled && s.mic_source.is_none();
                 let needs_destroy = !config.enabled && s.mic_source.is_some();
                 let needs_rebuild = config.enabled
-                    && s.mic_streams.is_some()
-                    && prev.input_device != config.input_device;
+                    && s.mic_streams.as_ref().is_some_and(|m| {
+                        prev.input_device != config.input_device
+                            || noise_needs_rebuild(
+                                prev.noise_suppression,
+                                config.noise_suppression,
+                                s.engine_failed,
+                                m.light_fallback,
+                                || deepfilter::find().is_some(),
+                            )
+                    });
                 let source_exists = s.node_by_name(MIC_NODE).is_some();
-                (needs_create, needs_destroy, needs_rebuild, source_exists, orphaned)
+                (
+                    needs_create,
+                    needs_destroy,
+                    needs_rebuild,
+                    source_exists,
+                    orphaned,
+                )
             };
 
             if needs_destroy {
@@ -1654,10 +2077,14 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
                     s.desired.remove(MIC_NODE);
                     s.mic_streams = None;
                     s.mic_links.clear();
-                    s.bus_links.retain(|(_, member), _| member.as_str() != MIC_NODE);
-                    s.send_gains.retain(|(_, member), _| member.as_str() != MIC_NODE);
-                    s.send_gain_in_links.retain(|(_, member), _| member.as_str() != MIC_NODE);
-                    s.send_gain_failed.retain(|(_, member)| member.as_str() != MIC_NODE);
+                    s.bus_links
+                        .retain(|(_, member), _| member.as_str() != MIC_NODE);
+                    s.send_gains
+                        .retain(|(_, member), _| member.as_str() != MIC_NODE);
+                    s.send_gain_in_links
+                        .retain(|(_, member), _| member.as_str() != MIC_NODE);
+                    s.send_gain_failed
+                        .retain(|(_, member)| member.as_str() != MIC_NODE);
                     if let Some(proxy) = s.mic_source.take() {
                         if let Some(core) = CORE.with(|c| c.borrow().clone()) {
                             let _ = core.destroy_object(proxy);
@@ -1687,17 +2114,12 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
                     Ok(proxy) => {
                         let mut s = state.borrow_mut();
                         s.mic_source = Some(proxy);
-                        s.desired
-                            .insert(MIC_NODE.to_string(), (config.output_label.clone(), 2));
-                        // Re-point streams that were capturing the old node
-                        // (target.object by name survives the recreation -
-                        // the session manager re-attaches them when the new
-                        // global appears). Type stays None deliberately:
-                        // that's what `pw-metadata <id> target.object <name>`
-                        // sets, and WirePlumber matches the value against
-                        // serials first, node names second, regardless of
-                        // the annotation. Spa:Id (used for serial-based
-                        // moves elsewhere) would be wrong for a name.
+                        s.desired.insert(
+                            MIC_NODE.to_string(),
+                            (config.output_label.clone(), NodeKind::Mic),
+                        );
+                        // Re-point by name, not id - WirePlumber matches
+                        // target.object by serial first, then name.
                         if let Some(meta) = &s.metadata {
                             for id in &orphaned {
                                 meta.set_property(*id, "target.object", None, Some(MIC_NODE));
@@ -1773,15 +2195,17 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
             } else {
                 "default.configured.audio.sink"
             };
-            // Build the Spa:String:JSON value with serde so backslashes,
-            // quotes and control chars are all escaped - a hand-rolled
-            // format! that only escaped `"` let a name ending in `\` break
-            // out of the quoted string and inject metadata keys (TD-018).
+            // Build the Spa:String:JSON value with serde: a hand-rolled format!
+            // escaping only `"` let a name ending in `\` inject keys.
             let value = serde_json::json!({ "name": name }).to_string();
             metadata.set_property(0, key, Some("Spa:String:JSON"), Some(&value));
             let _ = reply.send(Ok(()));
         }
-        Cmd::SetChannelOutput { sink_name, output_name, reply } => {
+        Cmd::SetChannelOutput {
+            sink_name,
+            output_name,
+            reply,
+        } => {
             if !is_virtual_sink(&sink_name) {
                 let _ = reply.send(Err(SinkError::UnknownSink(sink_name)));
                 return;
@@ -1793,7 +2217,11 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
             ensure_all_links(state);
             let _ = reply.send(Ok(()));
         }
-        Cmd::SetChannelFailover { sink_name, enabled, reply } => {
+        Cmd::SetChannelFailover {
+            sink_name,
+            enabled,
+            reply,
+        } => {
             if !is_virtual_sink(&sink_name) {
                 let _ = reply.send(Err(SinkError::UnknownSink(sink_name)));
                 return;
@@ -1809,7 +2237,11 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
             ensure_all_links(state);
             let _ = reply.send(Ok(()));
         }
-        Cmd::MoveStream { id, sink_name, reply } => {
+        Cmd::MoveStream {
+            id,
+            sink_name,
+            reply,
+        } => {
             let s = state.borrow();
             let Some(metadata) = s.metadata.as_ref() else {
                 let _ = reply.send(Err(SinkError::Config(
@@ -1867,6 +2299,26 @@ fn set_props(
     Ok(())
 }
 
+/// A stream's facts: node props over client props, except daemon-owned keys
+/// which come from the client. `client` is None, known-but-unbound, or present.
+fn stream_facts(
+    node_props: &HashMap<String, String>,
+    client: Option<Option<(&HashMap<String, String>, bool)>>,
+) -> (HashMap<String, String>, bool) {
+    let mut props: HashMap<String, String> = node_props
+        .iter()
+        .filter(|(k, _)| !crate::audio::types::daemon_owned(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let Some(Some((client_props, settled))) = client else {
+        return (props, true);
+    };
+    for (k, v) in client_props {
+        props.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    (props, settled)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1886,10 +2338,84 @@ mod tests {
     }
 
     #[test]
+    fn engine_plan_spawns_only_for_an_installed_unfailed_strong() {
+        let found = || Some(std::path::PathBuf::from("/p.so"));
+        assert_eq!(
+            plan_engine(NoiseSuppression::Light, false, found),
+            EnginePlan::Skip
+        );
+        assert_eq!(
+            plan_engine(NoiseSuppression::Off, false, found),
+            EnginePlan::Skip
+        );
+        assert_eq!(
+            plan_engine(NoiseSuppression::Strong, false, found),
+            EnginePlan::Spawn("/p.so".into())
+        );
+        assert_eq!(
+            plan_engine(NoiseSuppression::Strong, false, || None),
+            EnginePlan::Missing
+        );
+    }
+
+    #[test]
+    fn a_failed_engine_is_not_respawned_or_even_looked_up() {
+        let plan = plan_engine(NoiseSuppression::Strong, true, || {
+            panic!("a failed engine must not be looked up again")
+        });
+        assert_eq!(plan, EnginePlan::Failed);
+    }
+
+    #[test]
+    fn only_strong_transitions_and_a_newly_installed_plugin_rebuild() {
+        use NoiseSuppression::{Light, Off, Strong};
+        let never = || panic!("plugin lookup not needed");
+        assert!(noise_needs_rebuild(Light, Strong, false, false, never));
+        assert!(noise_needs_rebuild(Strong, Light, false, false, never));
+        assert!(noise_needs_rebuild(Strong, Off, false, false, never));
+        // Light and Off are a live parameter, no rebuild.
+        assert!(!noise_needs_rebuild(Light, Off, false, false, never));
+        assert!(!noise_needs_rebuild(Off, Light, false, false, never));
+        // Other mic settings changing under a running Strong.
+        assert!(!noise_needs_rebuild(Strong, Strong, false, false, never));
+        // Standing in with Light: start for real once installed, not after a failure.
+        assert!(noise_needs_rebuild(Strong, Strong, false, true, || true));
+        assert!(!noise_needs_rebuild(Strong, Strong, false, true, || false));
+        assert!(!noise_needs_rebuild(Strong, Strong, true, true, never));
+    }
+
+    #[test]
+    fn the_engine_may_only_feed_the_mic_capture() {
+        assert!(!engine_link_stray(Some(7), Some(9), 7, 9));
+        assert!(engine_link_stray(Some(7), Some(9), 7, 4));
+        // No capture yet: anything out of the engine is stray.
+        assert!(engine_link_stray(Some(7), None, 7, 9));
+        // Links between other nodes are not this rule's business.
+        assert!(!engine_link_stray(Some(7), Some(9), 3, 4));
+        assert!(!engine_link_stray(None, Some(9), 7, 4));
+    }
+
+    #[test]
+    fn noise_engine_streams_stay_out_of_the_app_list() {
+        // on_node skips INTERNAL_PREFIX names, so neither engine stream is
+        // ever offered as an app or a device.
+        assert!(deepfilter::CAPTURE_NAME.starts_with(INTERNAL_PREFIX));
+        assert!(deepfilter::OUTPUT_NAME.starts_with(INTERNAL_PREFIX));
+    }
+
+    #[test]
+    fn a_mic_can_be_pinned_to_a_virtual_source_too() {
+        assert!(is_capture_class(SOURCE_CLASS));
+        assert!(is_capture_class(VIRTUAL_SOURCE_CLASS));
+        assert!(!is_capture_class(SINK_CLASS));
+        assert!(!is_capture_class(STREAM_CLASS));
+    }
+
+    #[test]
     fn mixes_get_monitor_volumes_like_channels() {
-        assert!(node_needs_monitor_volumes(0));
-        assert!(node_needs_monitor_volumes(1));
-        assert!(!node_needs_monitor_volumes(2));
+        assert!(NodeKind::Channel.needs_monitor_volumes());
+        assert!(NodeKind::MixSource.needs_monitor_volumes());
+        assert!(!NodeKind::Mic.needs_monitor_volumes());
     }
 
     #[test]
@@ -1920,6 +2446,24 @@ mod tests {
         let mut pairs = desired_pairs(&s, 10, 20);
         pairs.sort_unstable();
         assert_eq!(pairs, vec![(1, 2), (1, 3)]);
+    }
+
+    #[test]
+    fn a_mix_takes_the_node_shape_its_role_asks_for() {
+        use crate::persistence::buses::MixRole;
+        assert_eq!(
+            NodeKind::mix(MixRole::Recording).media_class(),
+            VIRTUAL_SOURCE_CLASS
+        );
+        assert_eq!(NodeKind::mix(MixRole::Playback).media_class(), SINK_CLASS);
+        // Both shapes are still a mix: the member, mic and send-level
+        // commands all gate on that, and one of them is a sink.
+        assert!(
+            NodeKind::mix(MixRole::Recording).is_mix() && NodeKind::mix(MixRole::Playback).is_mix()
+        );
+        assert!(!NodeKind::Channel.is_mix() && !NodeKind::Mic.is_mix());
+        assert!(NodeKind::mix(MixRole::Playback).needs_monitor_volumes());
+        assert_eq!(NodeKind::Mic.audio_position(), "[ MONO ]");
     }
 
     #[test]
@@ -1957,10 +2501,19 @@ mod tests {
     #[test]
     fn resolve_target_covers_the_failover_matrix() {
         // Pinned and present -> that device, failover on or off.
-        assert_eq!(resolve_target(Some(7), true, false, Some(1), Some(2)), Some(7));
-        assert_eq!(resolve_target(Some(7), true, true, Some(1), Some(2)), Some(7));
+        assert_eq!(
+            resolve_target(Some(7), true, false, Some(1), Some(2)),
+            Some(7)
+        );
+        assert_eq!(
+            resolve_target(Some(7), true, true, Some(1), Some(2)),
+            Some(7)
+        );
         // Follow-default, failover on -> default, else the fallback sink.
-        assert_eq!(resolve_target(None, false, false, Some(1), Some(2)), Some(1));
+        assert_eq!(
+            resolve_target(None, false, false, Some(1), Some(2)),
+            Some(1)
+        );
         assert_eq!(resolve_target(None, false, false, None, Some(2)), Some(2));
         // Follow-default, failover off -> default only; silent when it's gone.
         assert_eq!(resolve_target(None, false, true, Some(1), Some(2)), Some(1));
@@ -1973,11 +2526,95 @@ mod tests {
     }
 
     #[test]
-    fn fallback_is_none_when_only_virtual_channel_sinks_exist() {
-        // Channel sinks are virtual and must never be a fallback target.
-        // (sink_mic/sink_stream are sources, excluded by media_class before
-        // reaching here - so they're not exercised at this layer.)
-        let candidates = [(1u32, "sink_game", 0i64), (2, "sink_chat", 0)];
+    fn listening_survives_a_channel_as_the_default() {
+        let node_ids: HashMap<String, u32> = [
+            ("sink_game".to_string(), 1u32),
+            ("alsa_output.usb-headset".to_string(), 9),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            listen_target(Some("alsa_output.usb-headset"), &node_ids, Some(5)),
+            Some(9)
+        );
+        // The bug: a channel as the default left monitors with no output.
+        assert_eq!(real_default(Some("sink_game"), &node_ids), None);
+        assert_eq!(
+            listen_target(Some("sink_game"), &node_ids, Some(9)),
+            Some(9)
+        );
+        assert_eq!(listen_target(None, &node_ids, Some(9)), Some(9));
+        assert_eq!(listen_target(Some("sink_game"), &node_ids, None), None);
+    }
+
+    #[test]
+    fn fallback_is_none_when_only_our_own_sinks_exist() {
+        // Pins: routing a channel into one of our own nodes must never win - a
+        // mix already receives every channel, so that would loop.
+        let candidates = [
+            (1u32, "sink_game", 0i64),
+            (2, "sink_chat", 0),
+            (3, "sink_stream", 0),
+            (4, "sink_bus_voice_only", 0),
+        ];
         assert_eq!(pick_fallback_sink(candidates.into_iter(), None), None);
+
+        // A real device among them still wins.
+        let candidates = [
+            (1u32, "sink_game", 0i64),
+            (3, "sink_stream", 0),
+            (9, "alsa_output.pci-0000_00_1f.3.analog-stereo", 1000),
+        ];
+        assert_eq!(pick_fallback_sink(candidates.into_iter(), None), Some(9));
+    }
+
+    fn kv(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_stream_cannot_forge_the_daemon_owned_props() {
+        let node = kv(&[
+            ("application.name", "evil"),
+            ("pipewire.sec.pid", "1"),
+            ("pipewire.access", "unrestricted"),
+            ("application.process.id", "1"),
+        ]);
+        let client = kv(&[
+            ("pipewire.sec.pid", "4242"),
+            ("pipewire.access", "flatpak"),
+            ("pipewire.access.portal.app_id", "com.example.App"),
+            ("application.name", "client-name"),
+        ]);
+        let (props, settled) = stream_facts(&node, Some(Some((&client, true))));
+        assert!(settled);
+        assert_eq!(props["pipewire.sec.pid"], "4242");
+        assert_eq!(props["pipewire.access"], "flatpak");
+        assert_eq!(props["pipewire.access.portal.app_id"], "com.example.App");
+        // Everything else: the node still wins over the client.
+        assert_eq!(props["application.name"], "evil");
+        assert_eq!(props["application.process.id"], "1");
+    }
+
+    #[test]
+    fn daemon_owned_props_never_survive_without_a_client() {
+        let node = kv(&[("pipewire.sec.pid", "1"), ("application.name", "x")]);
+        let (props, settled) = stream_facts(&node, None);
+        assert!(settled);
+        assert!(!props.contains_key("pipewire.sec.pid"));
+        let (props, settled) = stream_facts(&node, Some(None));
+        assert!(settled, "a client that never bound will not send more");
+        assert!(!props.contains_key("pipewire.sec.pid"));
+    }
+
+    #[test]
+    fn an_unsettled_client_leaves_the_stream_unsettled() {
+        let node = kv(&[("application.name", "x")]);
+        let client = kv(&[]);
+        let (_, settled) = stream_facts(&node, Some(Some((&client, false))));
+        assert!(!settled);
     }
 }

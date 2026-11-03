@@ -9,10 +9,8 @@ import {
 const POLL_INTERVAL_MS = 2000;
 
 /**
- * Boots the audio layer: creates the virtual sinks on mount, polls the app
- * stream list + device list every 2s while the window is on screen,
- * subscribes to live VU level events, and auto-loads profiles bound to
- * newly connected devices (Phase 5).
+ * Boots the audio layer: creates virtual sinks, then keeps app/device state
+ * and live levels polled while the window is visible.
  */
 export function useAudio() {
   const initialize = useMixerStore((s) => s.initialize);
@@ -46,10 +44,8 @@ export function useAudio() {
         id = undefined;
       }
     };
-    // Pause the 4-IPC poll while hidden in the tray - the product's dominant
-    // idle state - instead of round-tripping every 2s forever (TD-009). This
-    // only stops the UI refreshing: auto-routing is enforced by a backend
-    // ticker, so assignments hold while the window is away.
+    // Pause polling while hidden in the tray - the product's dominant idle
+    // state. Routing stays enforced by a ticker, so this only stops UI refresh.
     const onVisibility = () => (document.hidden ? stop() : start());
     if (!document.hidden) start();
     document.addEventListener("visibilitychange", onVisibility);
@@ -100,6 +96,14 @@ export function useAudio() {
       void unlisten.then((fn) => fn());
     };
   }, [onProfileChanged]);
+
+  // A hotkey moved the balance in the backend; the strips need the volumes.
+  useEffect(() => {
+    const unlisten = listen("channels-changed", () => void fetchChannels());
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, [fetchChannels]);
 
   // Hardware profile auto-switch: when a device with a bound profile
   // appears, load that profile (Sonar-style).

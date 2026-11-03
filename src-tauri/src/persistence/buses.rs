@@ -34,9 +34,8 @@ pub struct BusDef {
     /// Exclude mode (false): channels carried by this mix.
     /// Exclude mode (true): channels kept OUT of this mix.
     pub channels: Vec<String>,
-    /// True = the mix carries every channel except `channels`, so new
-    /// channels join automatically ("everything but music"). False = the
-    /// mix carries exactly `channels` (manual selection).
+    /// True = the mix carries every channel except `channels` ("everything but
+    /// music"). False = the mix carries exactly `channels` (manual selection).
     #[serde(default)]
     pub exclude: bool,
     /// Playback level recorders hear (0-150%). Persisted so a mix keeps its
@@ -53,6 +52,27 @@ pub struct BusDef {
     /// member's own volume. Keyed by sink name, or "sink_mic".
     #[serde(default)]
     pub member_gains: HashMap<String, u8>,
+    /// Which device list the mix shows up in. Named rather than a flag so
+    /// a third role can be added without rewriting anyone's config.
+    #[serde(default)]
+    pub role: MixRole,
+}
+
+/// Where a mix appears to the rest of the system.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MixRole {
+    /// A recording device, where a recorder looks first.
+    #[default]
+    Recording,
+    /// A playback device, captured through its monitor.
+    Playback,
+}
+
+impl MixRole {
+    pub fn is_recording(self) -> bool {
+        matches!(self, Self::Recording)
+    }
 }
 
 fn default_volume() -> u8 {
@@ -92,6 +112,7 @@ impl Default for Buses {
                 muted: false,
                 mic: false,
                 member_gains: HashMap::new(),
+                role: MixRole::Recording,
             }],
         }
     }
@@ -182,6 +203,13 @@ impl Buses {
         self.buses.iter().find(|b| b.name == name)
     }
 
+    fn get_mut(&mut self, name: &str) -> Result<&mut BusDef, SinkError> {
+        self.buses
+            .iter_mut()
+            .find(|b| b.name == name)
+            .ok_or_else(|| SinkError::UnknownSink(name.to_string()))
+    }
+
     /// Ensure the master mix exists, sits first, and carries every channel.
     /// Called wherever the channel set changes (init, add, profile load).
     pub fn sync_master(&mut self, channels: &[String]) {
@@ -196,6 +224,7 @@ impl Buses {
                 muted: false,
                 mic: false,
                 member_gains: HashMap::new(),
+                role: MixRole::Recording,
             },
         };
         def.channels = channels.to_vec();
@@ -216,11 +245,7 @@ impl Buses {
                 "the master mix always carries every channel".into(),
             ));
         }
-        let def = self
-            .buses
-            .iter_mut()
-            .find(|b| b.name == name)
-            .ok_or_else(|| SinkError::UnknownSink(name.to_string()))?;
+        let def = self.get_mut(name)?;
         if def.exclude == exclude {
             return Ok(());
         }
@@ -243,7 +268,9 @@ impl Buses {
     pub fn add(&mut self, label: &str) -> Result<BusDef, SinkError> {
         let label = label.trim();
         if label.is_empty() || label.len() > 24 {
-            return Err(SinkError::Config("mix label must be 1-24 characters".into()));
+            return Err(SinkError::Config(
+                "mix label must be 1-24 characters".into(),
+            ));
         }
         // The master mix doesn't count against the user's mixes.
         if self.buses.iter().filter(|b| !is_master(&b.name)).count() >= MAX_BUSES {
@@ -258,9 +285,8 @@ impl Buses {
             name = format!("{base}_{counter}");
             counter += 1;
         }
-        // New mixes start in auto-include mode carrying everything -
-        // uncheck what you don't want ("everything but music") and future
-        // channels keep joining automatically.
+        // New mixes start in auto-include mode carrying everything - uncheck
+        // what you don't want and future channels keep joining automatically.
         let def = BusDef {
             name,
             label: label.to_string(),
@@ -270,6 +296,7 @@ impl Buses {
             muted: false,
             mic: false,
             member_gains: HashMap::new(),
+            role: MixRole::Recording,
         };
         self.buses.push(def.clone());
         Ok(def)
@@ -278,13 +305,11 @@ impl Buses {
     pub fn rename(&mut self, name: &str, label: &str) -> Result<(), SinkError> {
         let label = label.trim();
         if label.is_empty() || label.len() > 24 {
-            return Err(SinkError::Config("mix label must be 1-24 characters".into()));
+            return Err(SinkError::Config(
+                "mix label must be 1-24 characters".into(),
+            ));
         }
-        let def = self
-            .buses
-            .iter_mut()
-            .find(|b| b.name == name)
-            .ok_or_else(|| SinkError::UnknownSink(name.to_string()))?;
+        let def = self.get_mut(name)?;
         def.label = label.to_string();
         Ok(())
     }
@@ -295,7 +320,7 @@ impl Buses {
         if is_master(name) {
             return Err(SinkError::Config("the master mix can't be deleted".into()));
         }
-        if !self.buses.iter().any(|b| b.name == name) {
+        if self.get(name).is_none() {
             return Err(SinkError::UnknownSink(name.to_string()));
         }
         Ok(())
@@ -313,31 +338,27 @@ impl Buses {
                 "the master mix always carries every channel".into(),
             ));
         }
-        let def = self
-            .buses
-            .iter_mut()
-            .find(|b| b.name == name)
-            .ok_or_else(|| SinkError::UnknownSink(name.to_string()))?;
+        let def = self.get_mut(name)?;
         def.channels = channels;
         Ok(())
     }
 
+    /// The updated definition comes back because the node has to be
+    /// rebuilt in the new shape from it.
+    pub fn set_role(&mut self, name: &str, role: MixRole) -> Result<BusDef, SinkError> {
+        let def = self.get_mut(name)?;
+        def.role = role;
+        Ok(def.clone())
+    }
+
     pub fn set_volume(&mut self, name: &str, volume: u8) -> Result<(), SinkError> {
-        let def = self
-            .buses
-            .iter_mut()
-            .find(|b| b.name == name)
-            .ok_or_else(|| SinkError::UnknownSink(name.to_string()))?;
+        let def = self.get_mut(name)?;
         def.volume_percent = volume;
         Ok(())
     }
 
     pub fn set_muted(&mut self, name: &str, muted: bool) -> Result<(), SinkError> {
-        let def = self
-            .buses
-            .iter_mut()
-            .find(|b| b.name == name)
-            .ok_or_else(|| SinkError::UnknownSink(name.to_string()))?;
+        let def = self.get_mut(name)?;
         def.muted = muted;
         Ok(())
     }
@@ -345,23 +366,20 @@ impl Buses {
     /// Allowed on the master mix too - unlike channel membership, mic
     /// inclusion isn't auto-managed.
     pub fn set_mic(&mut self, name: &str, mic: bool) -> Result<(), SinkError> {
-        let def = self
-            .buses
-            .iter_mut()
-            .find(|b| b.name == name)
-            .ok_or_else(|| SinkError::UnknownSink(name.to_string()))?;
+        let def = self.get_mut(name)?;
         def.mic = mic;
         Ok(())
     }
 
     /// Unity (100) drops the entry, so a fader back at rest doesn't bloat
     /// the persisted file.
-    pub fn set_member_gain(&mut self, name: &str, member: &str, percent: u8) -> Result<(), SinkError> {
-        let def = self
-            .buses
-            .iter_mut()
-            .find(|b| b.name == name)
-            .ok_or_else(|| SinkError::UnknownSink(name.to_string()))?;
+    pub fn set_member_gain(
+        &mut self,
+        name: &str,
+        member: &str,
+        percent: u8,
+    ) -> Result<(), SinkError> {
+        let def = self.get_mut(name)?;
         if percent == 100 {
             def.member_gains.remove(member);
         } else {
@@ -419,7 +437,9 @@ mod tests {
     fn master_is_protected_and_auto_synced() {
         let mut b = Buses::default();
         assert!(b.remove("sink_stream").is_err());
-        assert!(b.set_members("sink_stream", vec!["sink_game".into()]).is_err());
+        assert!(b
+            .set_members("sink_stream", vec!["sink_game".into()])
+            .is_err());
         // Renaming is allowed - recorders see the label.
         b.rename("sink_stream", "Everything").expect("renames");
 
@@ -467,10 +487,14 @@ mod tests {
         // …and a new channel joins without touching the definition.
         let mut grown = all.clone();
         grown.push("sink_voice".to_string());
-        assert_eq!(b.get(&mix.name).expect("mix").effective_members(&grown), grown);
+        assert_eq!(
+            b.get(&mix.name).expect("mix").effective_members(&grown),
+            grown
+        );
 
         // Keep music out: only music is stored; everything else flows.
-        b.set_members(&mix.name, vec!["sink_music".into()]).expect("sets");
+        b.set_members(&mix.name, vec!["sink_music".into()])
+            .expect("sets");
         assert_eq!(
             b.get(&mix.name).expect("mix").effective_members(&grown),
             vec!["sink_game", "sink_chat", "sink_voice"]
@@ -482,7 +506,8 @@ mod tests {
         let all = vec!["sink_game".to_string(), "sink_music".to_string()];
         let mut b = Buses::default();
         let mix = b.add("Mix").expect("adds"); // exclude, carries all
-        b.set_members(&mix.name, vec!["sink_music".into()]).expect("excludes music");
+        b.set_members(&mix.name, vec!["sink_music".into()])
+            .expect("excludes music");
 
         b.set_exclude(&mix.name, false, &all).expect("to manual");
         let def = b.get(&mix.name).expect("mix");
@@ -503,7 +528,10 @@ mod tests {
         b.sync_master(&["sink_game".into(), "sink_chat".into()]);
         // A channel disappeared: sync must drop it, not merge.
         b.sync_master(&["sink_game".into()]);
-        assert_eq!(b.get("sink_stream").expect("master").channels, vec!["sink_game"]);
+        assert_eq!(
+            b.get("sink_stream").expect("master").channels,
+            vec!["sink_game"]
+        );
         // No channels at all: the master mirrors that too.
         b.sync_master(&[]);
         assert!(b.get("sink_stream").expect("master").channels.is_empty());
@@ -553,24 +581,94 @@ mod tests {
     }
 
     #[test]
+    fn device_role_persists_and_defaults_to_a_recording_device() {
+        let mut b = Buses::default();
+        // The default is what a recorder expects to find in its input list.
+        assert!(b.buses[0].role.is_recording());
+
+        let def = b
+            .set_role("sink_stream", MixRole::Playback)
+            .expect("sets the role");
+        assert_eq!(def.role, MixRole::Playback);
+        assert_eq!(
+            b.get("sink_stream").expect("master").role,
+            MixRole::Playback
+        );
+        assert!(b
+            .set_role("sink_stream", MixRole::Recording)
+            .expect("sets back")
+            .role
+            .is_recording());
+
+        let mix = b.add("Voice Only").expect("adds");
+        assert!(
+            b.get(&mix.name).expect("mix").role.is_recording(),
+            "a new mix too"
+        );
+        assert!(b.set_role("sink_missing", MixRole::Playback).is_err());
+
+        b.set_role("sink_stream", MixRole::Playback)
+            .expect("sets the role");
+        b.sync_master(&["sink_game".into()]);
+        assert_eq!(
+            b.get("sink_stream").expect("master").role,
+            MixRole::Playback
+        );
+
+        // A buses.json written before this field keeps every mix where it
+        // was: an upgrade must not take anyone's mix out of obs.
+        let legacy = r#"{"buses":[{"name":"sink_stream","label":"Master Mix","channels":[],"exclude":false,"mic":true}]}"#;
+        let loaded: Buses = serde_json::from_str(legacy).expect("legacy loads");
+        assert!(loaded.buses[0].role.is_recording());
+        assert!(loaded.buses[0].mic);
+
+        // The name on disk is the word, so a new role can join it later.
+        let json = serde_json::to_string(&b).expect("serializes");
+        assert!(json.contains("\"role\":\"playback\""), "{json}");
+    }
+
+    #[test]
     fn member_gain_round_trips_and_unity_drops_the_entry() {
         let mut b = Buses::default();
-        b.set_member_gain("sink_stream", "sink_game", 60).expect("sets gain");
-        assert_eq!(b.get("sink_stream").expect("master").member_gains.get("sink_game"), Some(&60));
+        b.set_member_gain("sink_stream", "sink_game", 60)
+            .expect("sets gain");
+        assert_eq!(
+            b.get("sink_stream")
+                .expect("master")
+                .member_gains
+                .get("sink_game"),
+            Some(&60)
+        );
 
         // A mic send level, keyed the same way as a channel.
-        b.set_member_gain("sink_stream", "sink_mic", 130).expect("sets mic gain");
-        assert_eq!(b.get("sink_stream").expect("master").member_gains.get("sink_mic"), Some(&130));
+        b.set_member_gain("sink_stream", "sink_mic", 130)
+            .expect("sets mic gain");
+        assert_eq!(
+            b.get("sink_stream")
+                .expect("master")
+                .member_gains
+                .get("sink_mic"),
+            Some(&130)
+        );
 
         // Returning to unity (100) drops the entry rather than storing it.
-        b.set_member_gain("sink_stream", "sink_game", 100).expect("resets gain");
-        assert!(!b.get("sink_stream").expect("master").member_gains.contains_key("sink_game"));
+        b.set_member_gain("sink_stream", "sink_game", 100)
+            .expect("resets gain");
+        assert!(!b
+            .get("sink_stream")
+            .expect("master")
+            .member_gains
+            .contains_key("sink_game"));
 
         assert!(b.set_member_gain("sink_missing", "sink_game", 50).is_err());
 
         // Deleting the channel drops its per-mix send level too.
         b.remove_channel("sink_mic"); // exercises the mic key through the same path
-        assert!(!b.get("sink_stream").expect("master").member_gains.contains_key("sink_mic"));
+        assert!(!b
+            .get("sink_stream")
+            .expect("master")
+            .member_gains
+            .contains_key("sink_mic"));
 
         // Legacy buses.json written before this field loads at the default.
         let legacy = r#"{"buses":[{"name":"sink_stream","label":"Master Mix","channels":[],"exclude":false}]}"#;

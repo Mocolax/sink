@@ -81,9 +81,8 @@ export function MixerBoard() {
     );
   }
 
-  // Apps belonging to each channel, for the strip header. Mirrors the
-  // membership popover: live streams routed there plus remembered (offline)
-  // assignments - "3 apps" should match the 3 checked rows.
+  // Apps belonging to each channel, for the strip header - mirrors the
+  // membership popover so the count matches the checked rows there.
   const counts = new Map<string, number>();
   const counted = new Set<string>();
   for (const stream of appStreams) {
@@ -118,7 +117,9 @@ export function MixerBoard() {
 
   return (
     <div className="content">
-      <div className="screen-scroll" style={{ padding: 0 }}>
+      {/* The board centres itself and zooms to fit, so it skips the reserved
+          scrollbar track the other screens keep. */}
+      <div className="screen-scroll" style={{ padding: 0, overflowY: "auto" }}>
         <div className="mix-scroll">
           {micConfig?.enabled && (
             <>
@@ -172,22 +173,22 @@ export function MixerBoard() {
           {/* Mixes need the native backend; hide them on the pactl
            * fallback instead of showing strips that can't work. */}
           {backendNative !== false && (
-          <MixGroup
-            icon="podcasts"
-            label="Mixes"
-            count={`${buses.length}`}
-            hint="Recordable copies of your channels - add as an audio input in OBS"
-            onAdd={
-              buses.filter((b) => b.name !== MASTER_BUS).length < MAX_BUSES
-                ? () => setAddingMix(true)
-                : undefined
-            }
-            addTitle="Add a mix"
-          >
-            {buses.map((bus) => (
-              <BusStrip key={bus.name} bus={bus} />
-            ))}
-          </MixGroup>
+            <MixGroup
+              icon="podcasts"
+              label="Mixes"
+              count={`${buses.length}`}
+              hint="Recordable copies of your channels - add as an audio input in OBS"
+              onAdd={
+                buses.filter((b) => b.name !== MASTER_BUS).length < MAX_BUSES
+                  ? () => setAddingMix(true)
+                  : undefined
+              }
+              addTitle="Add a mix"
+            >
+              {buses.map((bus) => (
+                <BusStrip key={bus.name} bus={bus} />
+              ))}
+            </MixGroup>
           )}
         </div>
       </div>
@@ -219,7 +220,12 @@ export function MixerBoard() {
           ))}
         </div>
         <div className="modal-btns">
-          <button type="button" className="modal-btn primary" onClick={createChannel} disabled={!channelLabel.trim()}>
+          <button
+            type="button"
+            className="modal-btn primary"
+            onClick={createChannel}
+            disabled={!channelLabel.trim()}
+          >
             Create channel
           </button>
           <button type="button" className="modal-btn" onClick={closeChannelModal}>
@@ -230,8 +236,8 @@ export function MixerBoard() {
 
       <Modal open={addingMix} onClose={() => setAddingMix(false)} title="New mix">
         <p className="modal-text">
-          A mix is a capturable source: pick which channels it carries, then
-          select it by name in OBS or any recorder.
+          A mix is a capturable source: pick which channels it carries, then select it by name in
+          OBS or any recorder.
         </p>
         <input
           className="menu-input"
@@ -245,7 +251,12 @@ export function MixerBoard() {
           }}
         />
         <div className="modal-btns">
-          <button type="button" className="modal-btn primary" onClick={createMix} disabled={!mixLabel.trim()}>
+          <button
+            type="button"
+            className="modal-btn primary"
+            onClick={createMix}
+            disabled={!mixLabel.trim()}
+          >
             Create mix
           </button>
           <button type="button" className="modal-btn" onClick={() => setAddingMix(false)}>

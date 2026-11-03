@@ -42,7 +42,19 @@ export interface OutputDevice {
   description: string;
 }
 
-/** Phase 3 mic chain configuration (mirrors Rust MicConfig). */
+/** Mirrors Rust NoiseSuppression. */
+export type NoiseSuppression = "off" | "light" | "strong";
+
+/** Mirrors Rust deepfilter::EngineStatus (the opt-in Strong engine). */
+export interface NoiseEngineStatus {
+  supported: boolean;
+  installed: "system" | "downloaded" | null;
+  download_bytes: number;
+  version: string;
+  state: "idle" | "running" | "missing" | "failed";
+}
+
+/** Mirrors Rust MicConfig. */
 export interface MicConfig {
   enabled: boolean;
   /** node.name of the hardware mic (null = system default). */
@@ -59,6 +71,9 @@ export interface MicConfig {
   comp_threshold_db: number;
   comp_ratio: number;
   limiter_ceiling_db: number;
+  noise_suppression: NoiseSuppression;
+  /** Runs between the gate and the compressor. */
+  eq: EqConfig;
 }
 
 /** Default DSP values (markers on the tuning sliders). */
@@ -70,12 +85,7 @@ export const MIC_DSP_DEFAULTS = {
 } as const;
 
 /** Parametric EQ band shapes (mirrors Rust EqBandKind). */
-export type EqBandKind =
-  | "peaking"
-  | "low_shelf"
-  | "high_shelf"
-  | "low_pass"
-  | "high_pass";
+export type EqBandKind = "peaking" | "low_shelf" | "high_shelf" | "low_pass" | "high_pass";
 
 /** One parametric EQ band (mirrors Rust EqBand). */
 export interface EqBand {
@@ -86,6 +96,10 @@ export interface EqBand {
   /** Peaking/LP/HP: filter Q. Shelves: RBJ shelf slope. */
   q: number;
 }
+
+/** What an EQ preset is tuned for (mirrors Rust PresetTarget): channels
+ *  you hear, or the mic others hear. Each editor only offers its own kind. */
+export type PresetTarget = "output" | "mic";
 
 /** A channel's parametric EQ (mirrors Rust EqConfig). */
 export interface EqConfig {
@@ -133,6 +147,9 @@ export interface SeenApp {
 }
 
 /** A user-defined mix (record bus). The label is what recorders display. */
+/** Where a mix appears to the rest of the system. */
+export type MixRole = "recording" | "playback";
+
 export interface BusDef {
   name: string;
   label: string;
@@ -146,6 +163,8 @@ export interface BusDef {
   muted: boolean;
   /** Whether the processed virtual mic feeds this mix too. Persisted. */
   mic: boolean;
+  /** Which device list the mix shows up in. Persisted. */
+  role: MixRole;
   /** Per-member send level within this mix (0-150%); a member absent here
    *  carries at 100%. Keyed by channel sink name, or "sink_mic". */
   member_gains: Record<string, number>;
@@ -153,12 +172,10 @@ export interface BusDef {
 
 /** The channels a mix actually carries, given the full channel set. */
 export function busMembers(bus: BusDef, allChannels: string[]): string[] {
-  return bus.exclude
-    ? allChannels.filter((c) => !bus.channels.includes(c))
-    : bus.channels;
+  return bus.exclude ? allChannels.filter((c) => !bus.channels.includes(c)) : bus.channels;
 }
 
-/** Profile listing entry (Phase 5: trigger_device auto-loads the profile). */
+/** Profile listing entry; trigger_device auto-loads the profile. */
 export interface ProfileInfo {
   name: string;
   trigger_device: string | null;
@@ -172,4 +189,18 @@ export const MAX_MIC_GAIN = 200;
 /** Levels key for the mic chain. */
 export const MIC_LEVEL_KEY = "sink_mic";
 /** Node name of the always-on master mix (carries every channel). */
+export interface HotkeyShortcut {
+  id: string;
+  description: string;
+  /** Human-readable key; empty when nothing is bound yet. */
+  trigger: string;
+}
+
+export interface HotkeyStatus {
+  backend: "portal" | "x11" | "none";
+  shortcuts: HotkeyShortcut[];
+  balance_step: number;
+  steps: number[];
+}
+
 export const MASTER_BUS = "sink_stream";

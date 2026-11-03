@@ -3,7 +3,15 @@ name: Dev
 on:
   pull_request:
     branches: [main]
+    # `labeled` so adding a ci:<distro> label to an open PR starts the run;
+    # without it, a label changes nothing until the next push.
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
+    inputs:
+      distros:
+        description: "Install-test on these distros: all, or a comma list of arch, fedora, opensuse, debian, appimage"
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -13,12 +21,74 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Which distros to install-test. Packaging changes test everywhere;
+  # otherwise a PR opts in with a `ci:<distro>` label (or `ci:distros`).
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      distros: ${{ steps.pick.outputs.distros }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            packaging:
+              - 'packaging/**'
+              - 'src-tauri/tauri.conf.json'
+              - 'src-tauri/Cargo.toml'
+              - '.github/workflows/dev.yml'
+
+      - name: Pick the distros
+        id: pick
+        env:
+          PACKAGING: ${{ steps.filter.outputs.packaging }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          REQUESTED: ${{ inputs.distros }}
+        run: |
+          set -euo pipefail
+          all="arch fedora opensuse debian appimage"
+          on_pr=",${LABELS},"
+          on_dispatch=",$(echo "$REQUESTED" | tr -d '[:space:]'),"
+          picked=""
+          case "$on_pr$on_dispatch" in
+            *",ci:distros,"* | *",all,"*) picked="$all" ;;
+            *)
+              if [ "$PACKAGING" = "true" ]; then
+                picked="$all"
+              else
+                for d in $all; do
+                  case "$on_pr" in *",ci:$d,"*) picked="$picked $d"; continue ;; esac
+                  case "$on_dispatch" in *",$d,"*) picked="$picked $d" ;; esac
+                done
+              fi
+              ;;
+          esac
+          echo "install-testing: ${picked:-nothing}"
+          jq -nc --arg picked "$picked" '
+            {
+              # Runs on the runner itself (real desktop libs); a bare container
+              # would only prove it does not bundle gtk, by design.
+              arch:     "archlinux:latest",
+              fedora:   "fedora:latest",
+              opensuse: "opensuse/tumbleweed:latest",
+              debian:   "debian:trixie",
+              appimage: ""
+            } as $image
+            | [$picked | split(" ") | .[] | select(length > 0)
+               | {distro: ., image: $image[.]}]
+          ' | sed 's/^/distros=/' >> "$GITHUB_OUTPUT"
+
   check:
     runs-on: ubuntu-24.04
+    # The cap only catches a wedged step, not normal runtime.
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 22
           cache: npm
@@ -31,14 +101,15 @@ jobs:
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.9.1
         with:
           workspaces: .
+          # One cache for every job that compiles the same lockfile.
+          shared-key: sink
 
       - name: Install system dependencies
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          # A stalled runner mirror can hang apt for the job's full 6h
-          # limit (two Release runs on 2026-08-19); bound each attempt
-          # and retry so a transient mirror outage costs minutes.
+          # Bound each attempt and retry, so a transient mirror outage costs
+          # minutes instead of hanging apt for the job's full timeout.
           apt_try() {
             sudo timeout 300 apt-get update &&
               sudo timeout 600 apt-get install -y -o Acquire::Retries=3 \
@@ -53,17 +124,42 @@ jobs:
           apt_try || { sleep 30; apt_try; } || { sleep 120; apt_try; }
 
       - run: npm ci
+      - run: npm run format:check
+      - run: npm run lint
       - run: npx tsc --noEmit
       - run: npm test
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path src-tauri/Cargo.toml
 
+      # actionlint also shellchecks every `run:` block. Pinned by checksum:
+      # it's a Go binary, not a crate, so the install action can't fetch it.
+      - name: Lint the workflows
+        env:
+          ACTIONLINT_VERSION: "1.7.7"
+          ACTIONLINT_SHA256: "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757"
+        run: |
+          set -euo pipefail
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL --retry 3 -o /tmp/actionlint.tar.gz "$url"
+          echo "${ACTIONLINT_SHA256}  /tmp/actionlint.tar.gz" | sha256sum -c -
+          tar xzf /tmp/actionlint.tar.gz -C /tmp actionlint
+          /tmp/actionlint -color
+
+      # Advisories last, so a new one never hides whether the code passed.
+      - run: npm audit --audit-level=high
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit --file Cargo.lock
+
   bundles:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 22
           cache: npm
@@ -75,14 +171,15 @@ jobs:
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2.9.1
         with:
           workspaces: .
+          # One cache for every job that compiles the same lockfile.
+          shared-key: sink
 
       - name: Install system dependencies
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          # A stalled runner mirror can hang apt for the job's full 6h
-          # limit (two Release runs on 2026-08-19); bound each attempt
-          # and retry so a transient mirror outage costs minutes.
+          # Bound each attempt and retry, so a transient mirror outage costs
+          # minutes instead of hanging apt for the job's full timeout.
           apt_try() {
             sudo timeout 300 apt-get update &&
               sudo timeout 600 apt-get install -y -o Acquire::Retries=3 \
@@ -104,64 +201,135 @@ jobs:
       - run: npm ci
       - run: npm run tauri build
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: bundles
           path: |
             target/release/bundle/deb/*.deb
             target/release/bundle/rpm/*.rpm
+            target/release/bundle/appimage/*.AppImage
 
-  archpkg:
-    needs: bundles
+      - name: Say where the builds are
+        run: |
+          {
+            echo "### Builds from this pull request"
+            echo
+            echo "Download **bundles** at the bottom of this run for the deb,"
+            echo "the rpm and the AppImage. They are built from this branch,"
+            echo "so you can install one and try the change yourself."
+            echo
+            echo "The Arch package is repackaged from the deb, so it is only"
+            echo "built on request: add the \`ci:arch\` label to the pull"
+            echo "request and it appears here as **sink-arch-package**."
+            echo
+            echo "Labels for the rest: \`ci:fedora\`, \`ci:debian\`,"
+            echo "\`ci:opensuse\`, \`ci:appimage\`, or \`ci:distros\` for all."
+            echo "Each installs the build on that distro and launches it."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Install what `bundles` built and launch it, catching a missing runtime
+  # dependency; not required to merge since release.yml runs the same gate.
+  distros:
+    needs: [bundles, changes]
+    if: needs.changes.outputs.distros != '[]'
+    name: ${{ matrix.distro }}
     runs-on: ubuntu-24.04
-    container: archlinux:latest
+    timeout-minutes: 25
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.changes.outputs.distros) }}
     steps:
-      - run: pacman -Syu --noconfirm --needed base-devel
+      - name: Install the distro's tooling
+        run: |
+          set -eu
+          case "${{ matrix.distro }}" in
+            arch)
+              pacman -Syu --noconfirm --needed base-devel xorg-server-xvfb mesa
+              ;;
+            fedora)
+              dnf -y install xorg-x11-server-Xvfb mesa-dri-drivers findutils
+              ;;
+            opensuse)
+              # A tumbleweed base image has neither find nor xvfb-run.
+              zypper --non-interactive refresh
+              zypper --non-interactive install \
+                findutils xvfb-run xorg-x11-server-Xvfb Mesa-dri tar gzip
+              ;;
+            debian)
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y xvfb file
+              ;;
+            appimage)
+              # Headless runner: give it the graphics stack a desktop has, since
+              # an appimage isn't expected to ship drivers. Same for
+              # libpipewire: it must match the host's daemon, so it is never
+              # bundled, and the runner image stopped carrying it.
+              sudo apt-get update
+              sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                xvfb libegl1 libgl1 libgles2 libpipewire-0.3-0t64
+              ;;
+          esac
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: bundles
           path: bundles
 
-      - name: Build and smoke-test sink-bin
+      - name: Install sink
         run: |
-          set -euo pipefail
+          set -eu
           deb=$(find bundles -name 'sink_*_amd64.deb' | head -1)
-          ver=$(basename "$deb" | sed 's/^sink_//; s/_amd64\.deb$//')
-          useradd -m builder
-          install -d -o builder /build
-          cp "$deb" "/build/sink_${ver}_amd64.deb"
-          sum=$(sha256sum "/build/sink_${ver}_amd64.deb" | cut -d' ' -f1)
-          cp packaging/arch/PKGBUILD /build/PKGBUILD
-          sed -i "s/^pkgver=.*/pkgver=${ver}/; s/^sha256sums=.*/sha256sums=('${sum}')/" /build/PKGBUILD
-          chown -R builder:builder /build
-          sudo -u builder bash -lc 'cd /build && makepkg --noconfirm --nodeps'
-          pkg=$(ls /build/sink-bin-*-x86_64.pkg.tar.zst)
-          pacman -U --noconfirm "$pkg" >/dev/null
-          pacman -S --noconfirm --needed xorg-server-xvfb mesa >/dev/null
-          # A healthy tray app runs its event loop until timeout kills it (exit
-          # 124). Any earlier exit is a real failure: a missing shared library
-          # (the loader aborts before main), a tray/webkit init failure, or a
-          # panic. `|| true` + a panic-only grep would let all of those pass.
-          set +e
-          timeout 25 xvfb-run -a /usr/bin/sink >/tmp/launch.log 2>&1
-          code=$?
-          set -e
-          cat /tmp/launch.log || true
-          if grep -qiE 'panicked at|error while loading shared libraries|cannot open shared object|symbol lookup error' /tmp/launch.log; then
-            echo "::error::sink failed to start cleanly - see log above"
-            exit 1
-          fi
-          if [ "$code" -ne 124 ]; then
-            echo "::error::sink exited early (code $code) instead of staying alive for 25s"
-            exit 1
-          fi
-          echo "sink launched and stayed alive under xvfb"
-          cp "$pkg" "$GITHUB_WORKSPACE/"
+          rpm=$(find bundles -name 'sink-*.x86_64.rpm' | head -1)
+          case "${{ matrix.distro }}" in
+            arch)
+              # The AUR package repackages the deb; build it the same way.
+              ver=$(basename "$deb" | sed 's/^sink_//; s/_amd64\.deb$//')
+              useradd -m builder
+              install -d -o builder /build
+              cp "$deb" "/build/sink_${ver}_amd64.deb"
+              sum=$(sha256sum "/build/sink_${ver}_amd64.deb" | cut -d' ' -f1)
+              cp packaging/arch/PKGBUILD /build/PKGBUILD
+              sed -i "s/^pkgver=.*/pkgver=${ver}/; s/^sha256sums=.*/sha256sums=('${sum}')/" /build/PKGBUILD
+              chown -R builder:builder /build
+              sudo -u builder bash -lc 'cd /build && makepkg --noconfirm --nodeps'
+              pacman -U --noconfirm /build/sink-bin-*-x86_64.pkg.tar.zst
+              # Keep it: this is the only package the pr does not already
+              # build, and someone may want to install it themselves.
+              cp /build/sink-bin-*-x86_64.pkg.tar.zst .
+              ;;
+            fedora)
+              dnf -y install "$rpm"
+              ;;
+            opensuse)
+              zypper --non-interactive install --allow-unsigned-rpm "$rpm"
+              ;;
+            debian)
+              DEBIAN_FRONTEND=noninteractive apt-get install -y "./$deb"
+              ;;
+            appimage)
+              # The point of an AppImage is that it runs anywhere; extract
+              # rather than mount since a container has no /dev/fuse.
+              chmod +x "$(find bundles -name '*.AppImage' | head -1)"
+              ;;
+          esac
 
-      - uses: actions/upload-artifact@v7
+      - name: Launch it
+        run: |
+          set -eu
+          if [ "${{ matrix.distro }}" = appimage ]; then
+            app=$(find bundles -name '*.AppImage' | head -1)
+            packaging/smoke-test.sh "$app" --appimage-extract-and-run
+          else
+            packaging/smoke-test.sh
+          fi
+
+      - name: Attach the Arch package
+        if: matrix.distro == 'arch'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: sink-bin
+          name: sink-arch-package
           path: sink-bin-*-x86_64.pkg.tar.zst

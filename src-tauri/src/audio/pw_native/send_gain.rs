@@ -1,11 +1,6 @@
-//! Per-mix send gain: a lazy insert on one (member, mix) pair, alive only
-//! while that pair's level is off unity - at 100% the member links straight
-//! into the bus and this module costs nothing.
-//!
-//! source ──▶ capture ──gain──▶ ring ──▶ playback ──▶ bus
-//!
-//! Both ends are unmanaged (no autoconnect, no target); the loop in
-//! thread.rs owns and polices every link, same as the EQ insert.
+//! Per-mix send gain: a lazy insert on one (member, mix) pair, alive only while
+//! that pair's level is off unity - at 100% the member links straight into the
+//! bus and this module costs nothing.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -117,20 +112,23 @@ impl SendGainHandle {
                     return;
                 };
                 let datas = buffer.datas_mut();
-                let Some(data) = datas.first_mut() else { return };
+                let Some(data) = datas.first_mut() else {
+                    return;
+                };
                 let valid = data.chunk().size() as usize;
                 let Some(bytes) = data.data() else { return };
 
-                // Clamp to the scratch buffer's preallocated capacity: an
-                // oversized quantum must drop samples, never reallocate on
-                // the RT thread.
+                // Clamp to the scratch buffer's capacity: an oversized quantum
+                // must drop samples, never reallocate on the RT thread.
                 let n = ((valid.min(bytes.len())) / 4).min(ctx.scratch.capacity());
                 let gain = f32::from_bits(ctx.gain_bits.load(Ordering::Relaxed));
                 ctx.scratch.clear();
                 ctx.scratch.extend(
                     bytes[..n * 4]
-                        .chunks_exact(4)
-                        .map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]]) * gain),
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|b| f32::from_ne_bytes(*b) * gain),
                 );
                 ctx.ring.push(&ctx.scratch);
             })
@@ -172,7 +170,9 @@ impl SendGainHandle {
                 };
                 let requested = buffer.requested() as usize;
                 let datas = buffer.datas_mut();
-                let Some(data) = datas.first_mut() else { return };
+                let Some(data) = datas.first_mut() else {
+                    return;
+                };
                 let max_bytes = data.data().map(|d| d.len()).unwrap_or(0);
                 let max_frames = max_bytes / 8;
                 let frames = if requested > 0 {

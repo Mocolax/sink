@@ -1,10 +1,8 @@
-//! Native PipeWire backend (Phase 2): replaces pactl subprocess calls with
-//! pipewire-rs. All PipeWire objects live on a dedicated loop thread (see
-//! `thread.rs`); this facade sends commands over a pipewire channel and
-//! blocks on an mpsc reply with a timeout.
-//!
-//! Extras over the pactl backend: real per-sink level metering (`levels`).
+//! Native PipeWire backend: replaces pactl subprocess calls with pipewire-rs.
+//! All PipeWire objects live on a dedicated loop thread; this facade sends
+//! commands over a channel and blocks on an mpsc reply with a timeout.
 
+mod denoise;
 mod dsp;
 mod eq;
 mod eq_chain;
@@ -37,22 +35,29 @@ pub struct PipeWireBackend {
 }
 
 impl PipeWireBackend {
-    pub fn new() -> Result<Self, SinkError> {
+    /// Also returns a wake that fires when a new stream is ready to route.
+    pub fn new() -> Result<(Self, mpsc::Receiver<()>), SinkError> {
         let levels = Arc::new(LevelStore::new());
         let (sender, receiver) = pw::channel::channel();
         let (init_tx, init_rx) = mpsc::channel();
+        // One slot, so a burst of wakes collapses into one pass.
+        let (wake_tx, wake_rx) = mpsc::sync_channel(1);
 
         let thread_levels = levels.clone();
+        let self_tx = sender.clone();
         std::thread::Builder::new()
             .name("pipewire-loop".into())
-            .spawn(move || thread::run(receiver, init_tx, thread_levels))
+            .spawn(move || thread::run(receiver, self_tx, init_tx, thread_levels, wake_tx))
             .map_err(|e| SinkError::Config(format!("spawn pipewire thread: {e}")))?;
 
         match init_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(())) => Ok(Self {
-                sender: Mutex::new(sender),
-                levels,
-            }),
+            Ok(Ok(())) => Ok((
+                Self {
+                    sender: Mutex::new(sender),
+                    levels,
+                },
+                wake_rx,
+            )),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(SinkError::Config(
                 "pipewire loop did not come up within 5s".into(),
@@ -164,10 +169,20 @@ impl AudioBackend for PipeWireBackend {
         })
     }
 
-    fn create_bus(&self, name: &str, label: &str) -> Result<(), SinkError> {
+    fn create_bus(
+        &self,
+        name: &str,
+        label: &str,
+        role: crate::persistence::buses::MixRole,
+    ) -> Result<(), SinkError> {
         let name = name.to_string();
         let label = label.to_string();
-        self.request(|reply| Cmd::CreateBus { name, label, reply })
+        self.request(|reply| Cmd::CreateBus {
+            name,
+            label,
+            role,
+            reply,
+        })
     }
 
     fn destroy_bus(&self, name: &str) -> Result<(), SinkError> {
@@ -178,7 +193,11 @@ impl AudioBackend for PipeWireBackend {
     fn set_bus_members(&self, name: &str, channels: &[String]) -> Result<(), SinkError> {
         let name = name.to_string();
         let channels = channels.to_vec();
-        self.request(|reply| Cmd::SetBusMembers { name, channels, reply })
+        self.request(|reply| Cmd::SetBusMembers {
+            name,
+            channels,
+            reply,
+        })
     }
 
     fn set_bus_mic(&self, name: &str, mic: bool) -> Result<(), SinkError> {
@@ -186,15 +205,29 @@ impl AudioBackend for PipeWireBackend {
         self.request(|reply| Cmd::SetBusMic { name, mic, reply })
     }
 
-    fn set_bus_member_gain(&self, bus_name: &str, member: &str, percent: u8) -> Result<(), SinkError> {
+    fn set_bus_member_gain(
+        &self,
+        bus_name: &str,
+        member: &str,
+        percent: u8,
+    ) -> Result<(), SinkError> {
         let bus_name = bus_name.to_string();
         let member = member.to_string();
-        self.request(|reply| Cmd::SetBusMemberGain { bus_name, member, percent, reply })
+        self.request(|reply| Cmd::SetBusMemberGain {
+            bus_name,
+            member,
+            percent,
+            reply,
+        })
     }
 
     fn set_monitor(&self, name: &str, enabled: bool) -> Result<(), SinkError> {
         let name = name.to_string();
-        self.request(|reply| Cmd::SetMonitor { name, enabled, reply })
+        self.request(|reply| Cmd::SetMonitor {
+            name,
+            enabled,
+            reply,
+        })
     }
 
     fn list_input_devices(&self) -> Result<Vec<crate::audio::types::OutputDevice>, SinkError> {
@@ -206,6 +239,14 @@ impl AudioBackend for PipeWireBackend {
         self.request(|reply| Cmd::SetMicConfig { config, reply })
     }
 
+    fn retry_noise_engine(&self) -> Result<(), SinkError> {
+        self.request(|reply| Cmd::RetryEngine { reply })
+    }
+
+    fn noise_engine_state(&self) -> Result<crate::audio::deepfilter::EngineState, SinkError> {
+        self.request(|reply| Cmd::EngineState { reply })
+    }
+
     fn set_channel_eq(
         &self,
         sink_name: &str,
@@ -213,7 +254,11 @@ impl AudioBackend for PipeWireBackend {
     ) -> Result<(), SinkError> {
         let sink_name = sink_name.to_string();
         let config = config.clone();
-        self.request(|reply| Cmd::SetChannelEq { sink_name, config, reply })
+        self.request(|reply| Cmd::SetChannelEq {
+            sink_name,
+            config,
+            reply,
+        })
     }
 
     fn get_default_devices(&self) -> Result<(Option<String>, Option<String>), SinkError> {
@@ -222,11 +267,19 @@ impl AudioBackend for PipeWireBackend {
 
     fn set_default_output(&self, name: &str) -> Result<(), SinkError> {
         let name = name.to_string();
-        self.request(|reply| Cmd::SetDefault { input: false, name, reply })
+        self.request(|reply| Cmd::SetDefault {
+            input: false,
+            name,
+            reply,
+        })
     }
 
     fn set_default_input(&self, name: &str) -> Result<(), SinkError> {
         let name = name.to_string();
-        self.request(|reply| Cmd::SetDefault { input: true, name, reply })
+        self.request(|reply| Cmd::SetDefault {
+            input: true,
+            name,
+            reply,
+        })
     }
 }

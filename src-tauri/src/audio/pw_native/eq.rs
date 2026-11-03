@@ -1,16 +1,6 @@
-//! Per-channel parametric EQ core: RBJ Audio EQ Cookbook biquads in a
-//! cascade of up to MAX_EQ_BANDS, preceded by a preamp trim.
-//!
-//! Pure Rust, no external DSP crates (same stance as the mic chain in
-//! `dsp.rs`). The frequency-response math is hand-mirrored in
-//! `src/lib/eqMath.ts` for the UI curve - keep both in sync.
-//!
-//! Threading model: the command thread writes band parameters into
-//! `EqParams` (plain atomics) and bumps a generation counter with Release
-//! ordering; the RT capture callback owns an `EqEngine` and redesigns its
-//! coefficients only when an Acquire load of the generation sees a change.
-//! Coefficient design (a few sin/cos) off the hot path per *change*, not
-//! per buffer, and never a lock on the RT thread.
+//! Per-channel parametric EQ core: RBJ Audio EQ Cookbook biquads in a cascade,
+//! preceded by a preamp trim. Hand-mirrored in `src/lib/eqMath.ts` for the UI
+//! curve - keep both in sync.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
@@ -38,13 +28,11 @@ impl BiquadCoeffs {
         }
     }
 
-    /// RBJ Audio EQ Cookbook design. For shelves, `q` is the shelf slope S
-    /// (not a resonance Q) - the schema shares one field for both, see
-    /// `EqBand::q`. LowPass/HighPass ignore `gain_db`.
+    /// RBJ Audio EQ Cookbook design. For shelves, `q` is the shelf slope S, not
+    /// resonance Q - one field, two meanings (see `EqBand::q`).
     pub fn design(kind: EqBandKind, freq_hz: f32, gain_db: f32, q: f32, sample_rate: f32) -> Self {
-        // Guard the math: freq must sit below Nyquist and q must be
-        // positive. Config-level clamps enforce this for real input; this
-        // is the last line of defense against a divide-by-zero.
+        // Guard the math: freq below Nyquist, q positive - last line of defense
+        // against a divide-by-zero (config clamps handle real input).
         let freq = freq_hz.clamp(1.0, sample_rate * 0.49);
         let q = q.max(0.01);
         let w0 = 2.0 * std::f32::consts::PI * freq / sample_rate;
@@ -67,8 +55,7 @@ impl BiquadCoeffs {
                 // Shelf slope form: alpha from S, the cookbook's
                 // "shelf slope" parameterization.
                 let s = q;
-                let alpha =
-                    sin_w0 / 2.0 * ((a + 1.0 / a) * (1.0 / s - 1.0) + 2.0).max(0.0).sqrt();
+                let alpha = sin_w0 / 2.0 * ((a + 1.0 / a) * (1.0 / s - 1.0) + 2.0).max(0.0).sqrt();
                 let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
                 let (ap1, am1) = (a + 1.0, a - 1.0);
                 if kind == EqBandKind::LowShelf {
@@ -139,11 +126,26 @@ impl BiquadState {
     #[inline]
     fn process(&mut self, x: f32, c: &BiquadCoeffs) -> f32 {
         let y = c.b0 * x + self.z1;
-        self.z1 = c.b1 * x - c.a1 * y + self.z2;
-        self.z2 = c.b2 * x - c.a2 * y;
+        self.z1 = flush_denormal(c.b1 * x - c.a1 * y + self.z2);
+        self.z2 = flush_denormal(c.b2 * x - c.a2 * y);
         y
     }
 }
+
+/// Feedback state decays toward zero but never reaches it; once subnormal,
+/// every multiply costs a microcode assist on the RT thread.
+#[inline]
+pub(crate) fn flush_denormal(v: f32) -> f32 {
+    if v.abs() < DENORMAL_FLOOR {
+        0.0
+    } else {
+        v
+    }
+}
+
+/// Far above f32's smallest normal (1.2e-38) and far below anything
+/// audible (-400 dB).
+pub(crate) const DENORMAL_FLOOR: f32 = 1e-20;
 
 const KIND_PEAKING: u8 = 0;
 const KIND_LOW_SHELF: u8 = 1;
@@ -207,13 +209,8 @@ impl AtomicBand {
     }
 }
 
-/// Live-tunable EQ parameters shared with the RT capture callback.
-///
-/// Single writer (the loop thread handling commands), single reader (the RT
-/// callback). Field writes are Relaxed; the trailing Release bump of
-/// `generation` publishes them all to the reader's Acquire load - no locks,
-/// no retries, and torn *intermediate* states are impossible because the
-/// reader only redesigns after seeing a new generation.
+/// Live-tunable EQ params shared with the RT callback: field writes are
+/// Relaxed, a trailing Release bump of `generation` publishes atomically.
 pub struct EqParams {
     enabled: AtomicBool,
     preamp_bits: AtomicU32,
@@ -303,20 +300,33 @@ impl EqEngine {
         self.count = params.band_count.load(Ordering::Relaxed).min(MAX_EQ_BANDS);
         for i in 0..self.count {
             let band = params.bands[i].load();
-            self.coeffs[i] =
-                BiquadCoeffs::design(band.kind, band.freq_hz, band.gain_db, band.q, self.sample_rate);
+            self.coeffs[i] = BiquadCoeffs::design(
+                band.kind,
+                band.freq_hz,
+                band.gain_db,
+                band.q,
+                self.sample_rate,
+            );
         }
     }
 
-    /// Process an interleaved stereo buffer in place. Pass-through when the
-    /// config is disabled (the chain is normally torn down on disable; this
-    /// covers the window between a disable apply() and the relink).
+    /// Process an interleaved stereo buffer in place. Pass-through when
+    /// disabled - covers the window between a disable apply() and the relink.
     pub fn process_interleaved(&mut self, buf: &mut [f32], params: &EqParams) {
+        self.process_frames::<2>(buf, params);
+    }
+
+    /// The mic chain's EQ: always in line, so disabled is the steady state.
+    pub fn process_mono(&mut self, buf: &mut [f32], params: &EqParams) {
+        self.process_frames::<1>(buf, params);
+    }
+
+    fn process_frames<const CHANNELS: usize>(&mut self, buf: &mut [f32], params: &EqParams) {
         self.refresh(params);
         if !self.enabled {
             return;
         }
-        for frame in buf.chunks_exact_mut(2) {
+        for frame in buf.as_chunks_mut::<CHANNELS>().0 {
             for (ch, sample) in frame.iter_mut().enumerate() {
                 let mut x = *sample * self.preamp_linear;
                 for i in 0..self.count {
@@ -332,9 +342,36 @@ impl EqEngine {
 mod tests {
     use super::*;
 
-    /// Analytic magnitude response |H(e^jw)| in dB - exact, no time-domain
-    /// sampling artifacts. This is the same formula the UI curve uses
-    /// (src/lib/eqMath.ts), so these tests also pin the shared math.
+    // Before the flush, z1/z2 would sit at a subnormal indefinitely once the
+    // input went silent.
+    #[test]
+    fn filter_state_settles_to_exact_zero_over_silence() {
+        let c = BiquadCoeffs::design(EqBandKind::Peaking, 1000.0, 6.0, 1.0, SR);
+        let mut st = BiquadState::default();
+        for i in 0..4_800 {
+            st.process(0.5 * ((i as f32) * 0.13).sin(), &c);
+        }
+        assert!(
+            st.z1 != 0.0 || st.z2 != 0.0,
+            "state should carry after signal"
+        );
+        for _ in 0..(5 * SR as usize) {
+            st.process(0.0, &c);
+        }
+        assert_eq!((st.z1, st.z2), (0.0, 0.0));
+    }
+
+    #[test]
+    fn flush_leaves_any_audible_value_alone() {
+        for v in [1.0f32, -1.0, 1e-3, -1e-6, 1e-12, DENORMAL_FLOOR] {
+            assert_eq!(flush_denormal(v), v);
+        }
+        assert_eq!(flush_denormal(1e-30), 0.0);
+        assert_eq!(flush_denormal(-f32::MIN_POSITIVE / 4.0), 0.0);
+    }
+
+    /// Analytic magnitude response |H(e^jw)| in dB - exact, no sampling
+    /// artifacts; the same formula `src/lib/eqMath.ts` uses, pinning both.
     fn measured_gain_db(c: &BiquadCoeffs, freq: f32, sample_rate: f32) -> f32 {
         let w = 2.0 * std::f64::consts::PI * f64::from(freq) / f64::from(sample_rate);
         let (b0, b1, b2) = (f64::from(c.b0), f64::from(c.b1), f64::from(c.b2));
@@ -343,8 +380,8 @@ mod tests {
         let num_im = -(b1 * w.sin() + b2 * (2.0 * w).sin());
         let den_re = 1.0 + a1 * w.cos() + a2 * (2.0 * w).cos();
         let den_im = -(a1 * w.sin() + a2 * (2.0 * w).sin());
-        let mag = ((num_re * num_re + num_im * num_im) / (den_re * den_re + den_im * den_im))
-            .sqrt();
+        let mag =
+            ((num_re * num_re + num_im * num_im) / (den_re * den_re + den_im * den_im)).sqrt();
         (20.0 * mag.log10()) as f32
     }
 
@@ -395,7 +432,10 @@ mod tests {
         let c = BiquadCoeffs::design(EqBandKind::LowShelf, 200.0, 6.0, 0.71, SR);
         let low = measured_gain_db(&c, 40.0, SR);
         let high = measured_gain_db(&c, 4000.0, SR);
-        assert!((low - 6.0).abs() < 0.5, "low end should be ~+6 dB, got {low}");
+        assert!(
+            (low - 6.0).abs() < 0.5,
+            "low end should be ~+6 dB, got {low}"
+        );
         assert!(high.abs() < 0.5, "high end should be flat, got {high}");
     }
 
@@ -405,7 +445,10 @@ mod tests {
         let low = measured_gain_db(&c, 200.0, SR);
         let high = measured_gain_db(&c, 15000.0, SR);
         assert!(low.abs() < 0.5, "low end should be flat, got {low}");
-        assert!((high + 6.0).abs() < 0.6, "high end should be ~-6 dB, got {high}");
+        assert!(
+            (high + 6.0).abs() < 0.6,
+            "high end should be ~-6 dB, got {high}"
+        );
     }
 
     #[test]
@@ -414,7 +457,10 @@ mod tests {
         let pass = measured_gain_db(&c, 100.0, SR);
         let stop = measured_gain_db(&c, 8000.0, SR);
         assert!(pass.abs() < 0.5, "passband should be flat, got {pass}");
-        assert!(stop < -30.0, "stopband should be strongly attenuated, got {stop}");
+        assert!(
+            stop < -30.0,
+            "stopband should be strongly attenuated, got {stop}"
+        );
     }
 
     #[test]
@@ -422,7 +468,10 @@ mod tests {
         let c = BiquadCoeffs::design(EqBandKind::HighPass, 1000.0, 0.0, 0.71, SR);
         let stop = measured_gain_db(&c, 100.0, SR);
         let pass = measured_gain_db(&c, 8000.0, SR);
-        assert!(stop < -30.0, "stopband should be strongly attenuated, got {stop}");
+        assert!(
+            stop < -30.0,
+            "stopband should be strongly attenuated, got {stop}"
+        );
         assert!(pass.abs() < 0.5, "passband should be flat, got {pass}");
     }
 
@@ -441,11 +490,30 @@ mod tests {
         assert_eq!(engine.coeffs[0], expected);
 
         // A second apply with different bands is picked up on next refresh.
-        params.apply(&config(vec![band(EqBandKind::HighPass, 80.0, 0.0, 0.71)], 0.0));
+        params.apply(&config(
+            vec![band(EqBandKind::HighPass, 80.0, 0.0, 0.71)],
+            0.0,
+        ));
         engine.refresh(&params);
         assert_eq!(engine.count, 1);
         let expected = BiquadCoeffs::design(EqBandKind::HighPass, 80.0, 0.0, 0.71, SR);
         assert_eq!(engine.coeffs[0], expected);
+    }
+
+    #[test]
+    fn mono_filters_like_one_stereo_channel() {
+        let params = EqParams::from_config(&config(
+            vec![band(EqBandKind::Peaking, 1000.0, 6.0, 1.0)],
+            -2.0,
+        ));
+        let input: Vec<f32> = (0..480).map(|i| 0.5 * (i as f32 * 0.13).sin()).collect();
+        let mut mono = input.clone();
+        EqEngine::new(SR).process_mono(&mut mono, &params);
+        let mut stereo: Vec<f32> = input.iter().flat_map(|&x| [x, 0.0]).collect();
+        EqEngine::new(SR).process_interleaved(&mut stereo, &params);
+        let left: Vec<f32> = stereo.iter().step_by(2).copied().collect();
+        assert_eq!(mono, left);
+        assert_ne!(mono, input);
     }
 
     #[test]
@@ -492,7 +560,14 @@ mod tests {
     #[test]
     fn cascade_of_ten_flat_bands_is_still_flat() {
         let bands: Vec<EqBand> = (0..MAX_EQ_BANDS)
-            .map(|i| band(EqBandKind::Peaking, 100.0 * (i as f32 + 1.0) * 2.0, 0.0, 1.0))
+            .map(|i| {
+                band(
+                    EqBandKind::Peaking,
+                    100.0 * (i as f32 + 1.0) * 2.0,
+                    0.0,
+                    1.0,
+                )
+            })
             .collect();
         let params = EqParams::from_config(&config(bands, 0.0));
         let mut engine = EqEngine::new(SR);
@@ -524,7 +599,13 @@ mod tests {
         engine.process_interleaved(&mut buf, &params);
         let right_energy: f32 = buf.iter().skip(1).step_by(2).map(|s| s.abs()).sum();
         assert_eq!(right_energy, 0.0, "silent right channel picked up energy");
-        let left_tail = buf[3000..].iter().step_by(2).fold(0.0f32, |m, s| m.max(s.abs()));
-        assert!(left_tail < 0.01, "DC should be blocked on the left, got {left_tail}");
+        let left_tail = buf[3000..]
+            .iter()
+            .step_by(2)
+            .fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            left_tail < 0.01,
+            "DC should be blocked on the left, got {left_tail}"
+        );
     }
 }

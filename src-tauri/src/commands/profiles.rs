@@ -2,12 +2,10 @@ use tauri::State;
 
 use crate::persistence::channels::ChannelDef;
 use crate::persistence::profiles::{self, Profile, ProfileInfo};
-use crate::persistence::wireplumber;
 use crate::state::AppState;
 
 /// Persist the current mixer state into the active profile, if any.
-/// Profiles are live-bound: every profile-relevant mutation calls this so
-/// switching away and back never loses changes.
+/// Profiles are live-bound, so switching away and back never loses changes.
 pub fn autosave_active(mixer: &crate::mixer::state::MixerState) {
     let Some(name) = &mixer.active_profile else {
         return;
@@ -27,7 +25,7 @@ pub fn autosave_active(mixer: &crate::mixer::state::MixerState) {
     }
 }
 
-fn set_active(state: &State<'_, AppState>, name: Option<String>) -> Result<(), String> {
+fn set_active(state: &AppState, name: Option<String>) -> Result<(), String> {
     // Refresh the cached trigger from the profile we're binding to (a rare
     // profile switch, not the per-mutation autosave path).
     let trigger = name
@@ -60,7 +58,11 @@ pub fn set_profile_trigger(
     name: String,
     device: String,
 ) -> Result<(), String> {
-    let trigger = if device.is_empty() { None } else { Some(device) };
+    let trigger = if device.is_empty() {
+        None
+    } else {
+        Some(device)
+    };
     profiles::set_trigger(&name, trigger.clone()).map_err(|e| e.to_string())?;
     // Keep the cache in step so a later autosave doesn't overwrite the trigger
     // we just set on the active profile with a stale value.
@@ -71,16 +73,26 @@ pub fn set_profile_trigger(
     Ok(())
 }
 
-/// Apply a saved profile: reconcile the channel **layout** (create missing
-/// channels, remove extras - streams evacuate to the default first), then
-/// apply volumes/mutes/outputs, replace the assignment set, and clear the
-/// auto-route ledger so the new routing is enforced within the next poll.
+/// Apply a saved profile: reconcile channels, then clear the auto-route
+/// ledger and enforce the new routing right away.
 #[tauri::command]
 pub fn load_profile(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     name: String,
 ) -> Result<(), String> {
+    load_profile_on(&state, name)?;
+    crate::refresh_tray(&app);
+    Ok(())
+}
+
+pub fn load_profile_on(state: &AppState, name: String) -> Result<(), String> {
+    // A tray click, a hotkey and the UI can all land here at once; the
+    // reconcile below reads and writes the mixer in several steps.
+    let _switching = state
+        .profile_switch
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let profile = profiles::load(&name).map_err(|e| e.to_string())?;
     if profile.channels.is_empty() {
         return Err(format!("profile {name} has no channels"));
@@ -150,6 +162,7 @@ pub fn load_profile(
     }
 
     // ---- mix bus reconciliation ----
+    let _rebuild = state.lock_bus_rebuild();
     let mut target_buses = profile.buses.clone();
     // The master mix always exists and carries the profile's full channel
     // set (this also upgrades old profiles saved before the master model).
@@ -161,12 +174,26 @@ pub fn load_profile(
     };
     for old in &current_buses.buses {
         if target_buses.get(&old.name).is_none() {
-            let _ = state.backend.destroy_bus(&old.name);
+            if let Err(e) = state.backend.destroy_bus(&old.name) {
+                eprintln!("sink: removing mix {} for profile failed: {e}", old.name);
+            }
         }
     }
     for bus in &target_buses.buses {
-        if current_buses.get(&bus.name).is_none() {
-            if let Err(e) = state.backend.create_bus(&bus.name, &prefs.decorate(&bus.label)) {
+        // A mix whose role differs is a different kind of node, so the live
+        // one cannot be reused.
+        let live_role = current_buses.get(&bus.name).map(|b| b.role);
+        if live_role.is_some_and(|role| role != bus.role) {
+            if let Err(e) = state.backend.destroy_bus(&bus.name) {
+                eprintln!("sink: rebuilding mix {} for profile failed: {e}", bus.name);
+            }
+        }
+        if live_role != Some(bus.role) {
+            if let Err(e) =
+                state
+                    .backend
+                    .create_bus(&bus.name, &prefs.decorate(&bus.label), bus.role)
+            {
                 eprintln!("sink: profile mix {} failed: {e}", bus.name);
                 continue;
             }
@@ -178,7 +205,10 @@ pub fn load_profile(
             eprintln!("sink: profile members for mix {} failed: {e}", bus.name);
         }
         if let Err(e) = state.backend.set_bus_mic(&bus.name, bus.mic) {
-            eprintln!("sink: profile mic membership for mix {} failed: {e}", bus.name);
+            eprintln!(
+                "sink: profile mic membership for mix {} failed: {e}",
+                bus.name
+            );
         }
         crate::commands::buses::apply_bus_level(state.backend.as_ref(), bus);
         crate::commands::buses::apply_bus_member_gains(state.backend.as_ref(), bus);
@@ -196,9 +226,8 @@ pub fn load_profile(
                     label: c.label.clone(),
                     icon: c.icon.clone(),
                     stream_mix: c.stream_mix,
-                    // Carry the profile's levels into the persisted defs,
-                    // so channels.json stays the single source of truth
-                    // for what a channel comes back at.
+                    // Carry levels into the persisted defs so channels.json
+                    // stays the single source of truth.
                     volume_percent: c.volume_percent,
                     muted: c.muted,
                 })
@@ -222,19 +251,17 @@ pub fn load_profile(
     outputs.save().map_err(|e| e.to_string())?;
     eq.save().map_err(|e| e.to_string())?;
     target_buses.save().map_err(|e| e.to_string())?;
-    wireplumber::write(&assignments).map_err(|e| e.to_string())?;
+    crate::commands::devices::route_now(state);
     if let Ok(mut restore) = state.channel_group_mute_restore.lock() {
         *restore = None;
     }
     // The loaded profile becomes the live-bound (autosaving) one.
-    set_active(&state, Some(name))?;
-    crate::refresh_tray(&app);
+    set_active(state, Some(name))?;
     Ok(())
 }
 
 /// Create a profile with a clean slate: the classic four channels at
-/// 100%/unmuted, no assignments, all outputs following the default. It is
-/// saved but not applied - load it to start fresh.
+/// 100%/unmuted. Saved but not applied - load it to start fresh.
 #[tauri::command]
 pub fn create_blank_profile(app: tauri::AppHandle, name: String) -> Result<(), String> {
     let name = profiles::sanitize_name(&name).map_err(|e| e.to_string())?;

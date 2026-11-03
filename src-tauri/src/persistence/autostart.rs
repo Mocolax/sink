@@ -1,8 +1,6 @@
 //! Autostart on login via a systemd user unit
-//! (`~/.config/systemd/user/sink.service`). The unit is anchored to
-//! `graphical-session.target` so it starts with the desktop session (which
-//! also provides the WAYLAND_DISPLAY/DISPLAY environment) and after
-//! PipeWire is up.
+//! (`~/.config/systemd/user/sink.service`), anchored to
+//! `graphical-session.target` so it starts after PipeWire is up.
 
 use std::fs;
 use std::path::PathBuf;
@@ -25,7 +23,10 @@ fn render_unit() -> Result<String, SinkError> {
     // however unlikely) don't split into command + arguments.
     let exe = format!(
         "\"{}\"",
-        exe.display().to_string().replace('\\', "\\\\").replace('"', "\\\"")
+        exe.display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
     );
     // Boot to tray on login when the user asked for it. Only the autostart
     // launch carries this flag, so manual launches still show the window.

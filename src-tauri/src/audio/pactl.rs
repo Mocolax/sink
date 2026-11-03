@@ -5,24 +5,20 @@ use std::sync::Mutex;
 use serde::Deserialize;
 
 use crate::audio::backend::AudioBackend;
-use crate::audio::types::{is_virtual_sink, AppStream, OutputDevice};
+use crate::audio::types::{is_own_sink, is_virtual_sink, AppStream, OutputDevice};
 use crate::error::SinkError;
 
 /// `owner_module` value pactl uses when a sink has no owning module.
 const PA_INVALID_INDEX: u32 = u32::MAX;
 
-/// Phase 1 backend: drives the audio system through the `pactl` CLI, which
-/// works against both PulseAudio and PipeWire (via pipewire-pulse).
-///
-/// Uses `pactl --format=json` (available since PulseAudio 16) so parsing is
-/// structural rather than scraping human-oriented text.
+/// Backend that drives the audio system through the `pactl` CLI (works on both
+/// PulseAudio and PipeWire); `--format=json` avoids scraping text.
 pub struct PactlBackend {
-    /// sink name -> index of the `module-null-sink` module that owns it.
-    /// `create_virtual_sink` returns `()` per the trait, so module indices
-    /// are tracked here instead of in `MixerState`.
+    /// sink name -> index of the `module-null-sink` module that owns it,
+    /// tracked here since `create_virtual_sink` returns `()` per the trait.
     modules: Mutex<HashMap<String, u32>>,
-    /// channel sink name -> index of its `module-loopback` (Phase 4 output
-    /// routing fallback; the native backend uses passive links instead).
+    /// channel sink name -> index of its `module-loopback` (output routing
+    /// fallback; the native backend uses passive links instead).
     loopbacks: Mutex<HashMap<String, u32>>,
 }
 
@@ -117,8 +113,7 @@ impl PactlBackend {
     }
 
     /// Find the module index of a `module-null-sink` owning `sink_name` by
-    /// scanning the live module list. Fallback for when the in-memory table
-    /// has no entry (e.g. sink left over from a previous crashed run).
+    /// scanning live modules - covers a sink left over from a crashed run.
     fn find_null_sink_module(sink_name: &str) -> Result<Option<u32>, SinkError> {
         let modules: Vec<PactlModule> = Self::query("modules")?;
         let needle = format!("sink_name={sink_name}");
@@ -170,11 +165,8 @@ impl AudioBackend for PactlBackend {
             }
         }
 
-        // Quote the description and escape it so a label with whitespace
-        // (or quotes/backslashes) can't split into extra module properties -
-        // pactl parses `sink_properties` as a space-delimited proplist, and
-        // the value is otherwise attacker-influenced (TD-048). Control chars
-        // are dropped so a newline can't start a new property line.
+        // Escape the description so a label with whitespace/quotes can't split
+        // pactl's space-delimited sink_properties into extra properties.
         let desc: String = label
             .chars()
             .map(|c| if c.is_control() { ' ' } else { c })
@@ -226,9 +218,8 @@ impl AudioBackend for PactlBackend {
         Ok(inputs
             .into_iter()
             .map(|input| {
-                // Shared identity resolution: skips generic/wrapper names
-                // (e.g. "WEBRTC VoiceEngine" → the Discord binary). The
-                // winning property+value is the stream's persistent identity.
+                // Skips generic/wrapper names so the winning property+value
+                // becomes the stream's persistent identity.
                 let (app_name, match_prop, match_value) =
                     crate::audio::types::resolve_identity(|key| {
                         prop(&input.properties, key).map(str::to_string)
@@ -239,8 +230,18 @@ impl AudioBackend for PactlBackend {
                     .get(&input.sink)
                     .filter(|name| is_virtual_sink(name))
                     .cloned();
+                // pactl shows the client's own claims; the daemon-owned
+                // keys are dropped like the native backend does.
+                let props: HashMap<String, String> = input
+                    .properties
+                    .iter()
+                    .filter(|(k, _)| !crate::audio::types::daemon_owned(k))
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect();
 
                 AppStream {
+                    props,
+                    settled: true,
                     index: input.index,
                     // PulseAudio's sink-input index is itself never reused.
                     serial: u64::from(input.index),
@@ -265,7 +266,7 @@ impl AudioBackend for PactlBackend {
     fn list_output_devices(&self) -> Result<Vec<OutputDevice>, SinkError> {
         Ok(Self::list_sinks()?
             .into_iter()
-            .filter(|s| !is_virtual_sink(&s.name))
+            .filter(|s| !is_own_sink(&s.name))
             .map(|s| OutputDevice {
                 index: s.index,
                 name: s.name,
@@ -275,11 +276,7 @@ impl AudioBackend for PactlBackend {
     }
 
     fn set_sink_volume(&self, sink_name: &str, volume_percent: u8) -> Result<(), SinkError> {
-        Self::run(&[
-            "set-sink-volume",
-            sink_name,
-            &format!("{volume_percent}%"),
-        ])?;
+        Self::run(&["set-sink-volume", sink_name, &format!("{volume_percent}%")])?;
         Ok(())
     }
 
@@ -343,7 +340,12 @@ impl AudioBackend for PactlBackend {
         ))
     }
 
-    fn create_bus(&self, _name: &str, _label: &str) -> Result<(), SinkError> {
+    fn create_bus(
+        &self,
+        _name: &str,
+        _label: &str,
+        _role: crate::persistence::buses::MixRole,
+    ) -> Result<(), SinkError> {
         Err(SinkError::Config(
             "mix buses require the native PipeWire backend".into(),
         ))
@@ -365,7 +367,12 @@ impl AudioBackend for PactlBackend {
         ))
     }
 
-    fn set_bus_member_gain(&self, _bus_name: &str, _member: &str, _percent: u8) -> Result<(), SinkError> {
+    fn set_bus_member_gain(
+        &self,
+        _bus_name: &str,
+        _member: &str,
+        _percent: u8,
+    ) -> Result<(), SinkError> {
         Err(SinkError::Config(
             "per-mix send levels require the native PipeWire backend".into(),
         ))
@@ -378,8 +385,12 @@ impl AudioBackend for PactlBackend {
     }
 
     fn get_default_devices(&self) -> Result<(Option<String>, Option<String>), SinkError> {
-        let sink = Self::run(&["get-default-sink"]).ok().map(|s| s.trim().to_string());
-        let source = Self::run(&["get-default-source"]).ok().map(|s| s.trim().to_string());
+        let sink = Self::run(&["get-default-sink"])
+            .ok()
+            .map(|s| s.trim().to_string());
+        let source = Self::run(&["get-default-source"])
+            .ok()
+            .map(|s| s.trim().to_string());
         Ok((
             sink.filter(|s| !s.is_empty()),
             source.filter(|s| !s.is_empty()),
@@ -401,12 +412,8 @@ impl AudioBackend for PactlBackend {
         sink_name: &str,
         output_name: Option<&str>,
     ) -> Result<(), SinkError> {
-        // Replace any existing loopback for this channel - by asking the
-        // server, not just our own table. A previous run that died without
-        // teardown leaves its modules loaded, and stacking a fresh set on
-        // top plays the channel once per leftover. (This assumes a single
-        // Sink instance - sink names are deterministic, so two live
-        // instances would already be fighting over the nodes themselves.)
+        // Ask the server for existing loopbacks, not just our table - a crashed
+        // prior run leaves modules loaded, and stacking more would double-play.
         {
             let mut loopbacks = self
                 .loopbacks
@@ -495,6 +502,9 @@ mod tests {
         let inputs: Vec<PactlSinkInput> =
             serde_json::from_str(json).expect("sink-input json should parse");
         assert_eq!(inputs[0].index, 12);
-        assert_eq!(prop(&inputs[0].properties, "application.name"), Some("Firefox"));
+        assert_eq!(
+            prop(&inputs[0].properties, "application.name"),
+            Some("Firefox")
+        );
     }
 }

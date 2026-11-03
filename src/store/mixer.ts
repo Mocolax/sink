@@ -5,17 +5,22 @@ import type {
   BusDef,
   EqConfig,
   MicConfig,
+  MixRole,
   OutputDevice,
   ProfileInfo,
   SeenApp,
   VirtualSink,
 } from "../types";
 
-// Faders fire on every pointer move; debounce backend calls per target so a
-// drag doesn't spawn a pactl subprocess per pixel. UI state updates
-// optimistically and immediately.
+// Faders fire on every pointer move; debounce per target so a drag doesn't
+// spawn a pactl subprocess per pixel. UI state updates optimistically.
 const pendingInvokes = new Map<string, number>();
-function debouncedInvoke(key: string, cmd: string, args: Record<string, unknown>, onError: (e: unknown) => void) {
+function debouncedInvoke(
+  key: string,
+  cmd: string,
+  args: Record<string, unknown>,
+  onError: (e: unknown) => void,
+) {
   const existing = pendingInvokes.get(key);
   if (existing !== undefined) clearTimeout(existing);
   pendingInvokes.set(
@@ -48,15 +53,13 @@ interface MixerStore {
   /** Channel -> chosen output node name (null = follow system default). */
   channelOutputs: Record<string, string | null>;
   /**
-   * Channel -> the device node name it is actually routed to right now (after
-   * default/fallback resolution). Lets a follow-default strip show where its
-   * audio really goes, and reflects failover. Empty on the pactl fallback.
+   * Channel -> the device node name it is actually routed to right now.
+   * Lets a follow-default strip show where audio really goes and reflects failover.
    */
   resolvedOutputs: Record<string, string | null>;
   /**
    * Channel -> whether it fails over to another device when its chosen device
-   * (or the default) is gone. Off = play only on the chosen device / exact
-   * default, silence otherwise. Defaults to on (absent treated as true).
+   * is gone. Defaults to on (absent treated as true).
    */
   channelFailover: Record<string, boolean>;
   fetchOutputs: () => Promise<void>;
@@ -68,13 +71,13 @@ interface MixerStore {
   eqConfigs: Record<string, EqConfig>;
   fetchEq: () => Promise<void>;
   setChannelEq: (sinkName: string, config: EqConfig) => Promise<void>;
-  /** Mic chain (Phase 3). Null until loaded. */
+  /** Null until loaded. */
   micConfig: MicConfig | null;
   inputDevices: OutputDevice[];
   fetchMic: () => Promise<void>;
   setMicConfig: (patch: Partial<MicConfig>) => Promise<void>;
   profiles: ProfileInfo[];
-  /** Bind/clear an output device that auto-loads a profile (Phase 5). */
+  /** Bind or clear the output device that auto-loads a profile. */
   setProfileTrigger: (name: string, device: string | null) => Promise<void>;
   /** Create a clean-slate profile (saved, not applied). */
   createBlankProfile: (name: string) => Promise<void>;
@@ -83,7 +86,10 @@ interface MixerStore {
   /** App history (live + gone + ignored). */
   seenApps: SeenApp[];
   fetchSeenApps: () => Promise<void>;
-  setAppIgnored: (app: { match_prop: string; match_value: string }, ignored: boolean) => Promise<void>;
+  setAppIgnored: (
+    app: { match_prop: string; match_value: string },
+    ignored: boolean,
+  ) => Promise<void>;
   forgetApp: (app: { match_prop: string; match_value: string }) => Promise<void>;
   /** Pre-route an app that isn't currently running (null clears). */
   setAppAssignment: (
@@ -110,6 +116,8 @@ interface MixerStore {
   setBusExclude: (name: string, exclude: boolean) => Promise<void>;
   /** Whether the processed virtual mic feeds this mix too; persisted. */
   setBusMic: (name: string, mic: boolean) => Promise<void>;
+  /** Which device list the mix shows up in. */
+  setBusRole: (name: string, role: MixRole) => Promise<void>;
   /** A mix's playback level for recorders (0-150%); persisted. */
   setBusVolume: (name: string, volume: number) => Promise<void>;
   /** Mute a mix for recorders; persisted. */
@@ -165,9 +173,8 @@ interface MixerStore {
 }
 
 /** Structural equality via JSON, to skip no-op store writes on each poll and
- *  avoid re-rendering the whole board when nothing changed (TD-029). */
-const jsonEqual = (a: unknown, b: unknown): boolean =>
-  JSON.stringify(a) === JSON.stringify(b);
+ *  avoid re-rendering the whole board when nothing changed. */
+const jsonEqual = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
 
 export const useMixerStore = create<MixerStore>((set, get) => ({
   channels: [],
@@ -329,26 +336,17 @@ export const useMixerStore = create<MixerStore>((set, get) => ({
 
   setChannelVolume: async (sinkName, volume) => {
     set((s) => ({
-      channels: s.channels.map((c) =>
-        c.name === sinkName ? { ...c, volume_percent: volume } : c,
-      ),
+      channels: s.channels.map((c) => (c.name === sinkName ? { ...c, volume_percent: volume } : c)),
     }));
-    debouncedInvoke(
-      `chvol:${sinkName}`,
-      "set_channel_volume",
-      { sinkName, volume },
-      (e) => {
-        set({ error: String(e) });
-        void get().fetchChannels();
-      },
-    );
+    debouncedInvoke(`chvol:${sinkName}`, "set_channel_volume", { sinkName, volume }, (e) => {
+      set({ error: String(e) });
+      void get().fetchChannels();
+    });
   },
 
   toggleMute: async (sinkName, muted) => {
     set((s) => ({
-      channels: s.channels.map((c) =>
-        c.name === sinkName ? { ...c, muted } : c,
-      ),
+      channels: s.channels.map((c) => (c.name === sinkName ? { ...c, muted } : c)),
     }));
     try {
       await invoke("toggle_channel_mute", { sinkName, muted });
@@ -386,11 +384,8 @@ export const useMixerStore = create<MixerStore>((set, get) => ({
         a.index === streamIndex ? { ...a, volume_percent: volume } : a,
       ),
     }));
-    debouncedInvoke(
-      `appvol:${streamIndex}`,
-      "set_app_volume",
-      { streamIndex, volume },
-      (e) => set({ error: String(e) }),
+    debouncedInvoke(`appvol:${streamIndex}`, "set_app_volume", { streamIndex, volume }, (e) =>
+      set({ error: String(e) }),
     );
   },
 
@@ -686,9 +681,7 @@ export const useMixerStore = create<MixerStore>((set, get) => ({
       buses: s.buses.map((b) => {
         if (b.name !== name || b.exclude === exclude) return b;
         // Preserve the carried set; only the stored representation flips.
-        const carried = b.exclude
-          ? all.filter((c) => !b.channels.includes(c))
-          : b.channels;
+        const carried = b.exclude ? all.filter((c) => !b.channels.includes(c)) : b.channels;
         return {
           ...b,
           exclude,
@@ -698,6 +691,18 @@ export const useMixerStore = create<MixerStore>((set, get) => ({
     }));
     try {
       await invoke("set_bus_exclude", { name, exclude });
+    } catch (e) {
+      set({ error: String(e) });
+      await get().fetchBuses();
+    }
+  },
+
+  setBusRole: async (name, role) => {
+    set((s) => ({
+      buses: s.buses.map((b) => (b.name === name ? { ...b, role } : b)),
+    }));
+    try {
+      await invoke("set_bus_role", { name, role });
     } catch (e) {
       set({ error: String(e) });
       await get().fetchBuses();
@@ -729,15 +734,18 @@ export const useMixerStore = create<MixerStore>((set, get) => ({
   setBusMemberGain: async (bus, member, percent) => {
     set((s) => ({
       buses: s.buses.map((b) =>
-        b.name === bus
-          ? { ...b, member_gains: { ...b.member_gains, [member]: percent } }
-          : b,
+        b.name === bus ? { ...b, member_gains: { ...b.member_gains, [member]: percent } } : b,
       ),
     }));
-    debouncedInvoke(`busgain:${bus}:${member}`, "set_bus_member_gain", { bus, member, percent }, (e) => {
-      set({ error: String(e) });
-      void get().fetchBuses();
-    });
+    debouncedInvoke(
+      `busgain:${bus}:${member}`,
+      "set_bus_member_gain",
+      { bus, member, percent },
+      (e) => {
+        set({ error: String(e) });
+        void get().fetchBuses();
+      },
+    );
   },
 
   openMixFaderWindow: async (bus) => {

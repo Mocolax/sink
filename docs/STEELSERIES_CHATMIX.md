@@ -46,13 +46,14 @@ starting or quitting the GUI does not change an output. If Sink starts while
 the headset is already online, that first sample only prepares a guarded
 restoration snapshot for the first disconnect. On a real
 disconnected-to-connected transition, Sink remembers the prior system default,
-activates the configured destination for every channel, and makes Game the
-system default. It also snapshots the effective physical destination of each
+activates the configured destination for every channel, and makes the headset
+the system default, so the desktop volume controls the headset itself. It also snapshots the effective physical destination of each
 claimed channel. On disconnect it restores that exact destination when the channel is
 still on the automatically selected output and its saved setting has not
 changed. This matters when "System default" would otherwise select a connected
 dongle whose headset is powered off. It restores the remembered system default
-only if the current default is still one of Sink's channels. Application
+(or, if there is none, the best other device) only if the current default is
+still the headset or one of Sink's channels. Application
 assignments remain on Sink's channels throughout both transitions.
 
 The HID worker does not process reports until the virtual channels and their

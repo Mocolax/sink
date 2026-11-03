@@ -164,7 +164,8 @@ impl AutoSwitchState {
         online: bool,
         enabled: bool,
         current_default: Option<&str>,
-        controlled: &[String],
+        // Defaults Sink may have set itself: the headset and the channels.
+        owned: &[String],
     ) -> AutoSwitchAction {
         let Some(previous_online) = self.observed_online.replace(online) else {
             return if online && enabled {
@@ -182,12 +183,12 @@ impl AutoSwitchState {
         }
         if online {
             self.previous_default = current_default
-                .filter(|name| !controlled.iter().any(|candidate| candidate == name))
+                .filter(|name| !owned.iter().any(|candidate| candidate == name))
                 .map(str::to_string);
             AutoSwitchAction::Claim
         } else {
             let restore = current_default
-                .filter(|name| controlled.iter().any(|candidate| candidate == name))
+                .filter(|name| owned.iter().any(|candidate| candidate == name))
                 .and_then(|_| self.previous_default.take());
             // Always release the temporary per-channel output claims. The
             // previous system default is optional because a manual default
@@ -599,7 +600,12 @@ fn apply_auto_switch(app: &tauri::AppHandle, machine: &mut AutoSwitchState, onli
         .get_default_devices()
         .ok()
         .and_then(|(output, _)| output);
-    match machine.observe(online, prefs.auto_switch, current.as_deref(), &controlled) {
+    let owned: Vec<String> = controlled
+        .iter()
+        .cloned()
+        .chain(prefs.output.clone())
+        .collect();
+    match machine.observe(online, prefs.auto_switch, current.as_deref(), &owned) {
         AutoSwitchAction::None => {}
         AutoSwitchAction::Prime => {
             let Some(target) = prefs.output.as_deref() else {
@@ -628,7 +634,11 @@ fn apply_auto_switch(app: &tauri::AppHandle, machine: &mut AutoSwitchState, onli
                     continue;
                 }
                 let alternate = if saved.is_none() {
-                    state.backend.preferred_output_excluding(target).ok().flatten()
+                    state
+                        .backend
+                        .preferred_output_excluding(target)
+                        .ok()
+                        .flatten()
                 } else {
                     None
                 };
@@ -675,6 +685,19 @@ fn apply_auto_switch(app: &tauri::AppHandle, machine: &mut AutoSwitchState, onli
                     }
                 }
             }
+            // Nothing to restore (the headset was already the default when it
+            // came online): leave the headset for the best other device.
+            let previous = previous.or_else(|| {
+                let target = prefs.output.as_deref()?;
+                current
+                    .as_deref()
+                    .filter(|name| owned.iter().any(|candidate| candidate == name))?;
+                state
+                    .backend
+                    .preferred_output_excluding(target)
+                    .ok()
+                    .flatten()
+            });
             if let Some(previous) = previous {
                 if let Err(e) = state.backend.set_default_output(&previous) {
                     eprintln!("sink: restoring the pre-headset output failed: {e}");
@@ -682,24 +705,17 @@ fn apply_auto_switch(app: &tauri::AppHandle, machine: &mut AutoSwitchState, onli
             }
         }
         AutoSwitchAction::Claim => {
-            let Some(fallback_channel) = controlled.first().cloned() else {
+            if controlled.is_empty() {
                 return;
-            };
-            let (outputs, game_channel) = {
+            }
+            let outputs = {
                 let Ok(mixer) = state.lock_mixer() else {
                     return;
                 };
-                (
-                    auto_switch_output_plan(
-                        &controlled,
-                        &mixer.outputs.outputs,
-                        prefs.output.as_deref(),
-                    ),
-                    mixer
-                        .channel_defs
-                        .get("sink_game")
-                        .map(|_| "sink_game".to_string())
-                        .unwrap_or(fallback_channel),
+                auto_switch_output_plan(
+                    &controlled,
+                    &mixer.outputs.outputs,
+                    prefs.output.as_deref(),
                 )
             };
             let resolved = state.backend.resolved_channel_outputs().unwrap_or_default();
@@ -741,8 +757,10 @@ fn apply_auto_switch(app: &tauri::AppHandle, machine: &mut AutoSwitchState, onli
                     );
                 }
             }
-            if let Err(e) = state.backend.set_default_output(&game_channel) {
-                eprintln!("sink: setting the Game channel as default failed: {e}");
+            if let Some(target) = prefs.output.as_deref() {
+                if let Err(e) = state.backend.set_default_output(target) {
+                    eprintln!("sink: setting the headset as default failed: {e}");
+                }
             }
         }
     }
@@ -1007,8 +1025,8 @@ mod tests {
 
     #[test]
     fn autoswitch_plan_claims_every_configured_channel() {
-        let controlled = ["sink_game", "sink_chat", "sink_music", "sink_system"]
-            .map(str::to_string);
+        let controlled =
+            ["sink_game", "sink_chat", "sink_music", "sink_system"].map(str::to_string);
         let saved_outputs = HashMap::from([
             ("sink_game".to_string(), None),
             ("sink_chat".to_string(), Some("speakers".to_string())),
@@ -1016,11 +1034,7 @@ mod tests {
             ("sink_system".to_string(), Some("hdmi".to_string())),
         ]);
 
-        let plan = auto_switch_output_plan(
-            &controlled,
-            &saved_outputs,
-            Some("alsa_output.arctis"),
-        );
+        let plan = auto_switch_output_plan(&controlled, &saved_outputs, Some("alsa_output.arctis"));
 
         assert_eq!(plan.len(), controlled.len());
         assert_eq!(
@@ -1058,7 +1072,7 @@ mod tests {
     #[test]
     fn disconnect_and_reconnect_claim_and_release() {
         let mut state = AutoSwitchState::default();
-        let controlled = vec!["sink_game".to_string(), "sink_chat".to_string()];
+        let controlled = vec!["sink_game".to_string(), "arctis".to_string()];
         assert_eq!(
             state.observe(false, true, Some("speakers"), &controlled),
             AutoSwitchAction::None
@@ -1069,7 +1083,7 @@ mod tests {
         );
         assert_eq!(state.previous_default.as_deref(), Some("speakers"));
         assert_eq!(
-            state.observe(false, true, Some("sink_game"), &controlled),
+            state.observe(false, true, Some("arctis"), &controlled),
             AutoSwitchAction::Release(Some("speakers".into()))
         );
         assert_eq!(

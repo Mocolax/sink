@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+
+use serde::Serialize;
 use tauri::State;
 
 use crate::audio::types::is_virtual_sink;
@@ -5,6 +8,232 @@ use crate::persistence::wireplumber;
 use crate::state::AppState;
 
 pub(crate) const MAX_VOLUME: u8 = 150;
+const CHANNEL_GROUP_STEP: u8 = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelGroupAction {
+    Increase,
+    Decrease,
+    ToggleMute,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ChannelGroupResult {
+    pub level_percent: u8,
+    pub muted: bool,
+}
+
+pub fn channel_group_action_from_args(args: &[String]) -> Option<ChannelGroupAction> {
+    args.iter().find_map(|arg| match arg.as_str() {
+        "--channels-volume-up" => Some(ChannelGroupAction::Increase),
+        "--channels-volume-down" => Some(ChannelGroupAction::Decrease),
+        "--channels-volume-mute" => Some(ChannelGroupAction::ToggleMute),
+        _ => None,
+    })
+}
+
+fn scaled_channel_volumes(
+    current: &[(String, u8)],
+    action: ChannelGroupAction,
+) -> Vec<(String, u8)> {
+    let current_max = current.iter().map(|(_, volume)| *volume).max().unwrap_or(0);
+    let target_max = match action {
+        ChannelGroupAction::Increase => current_max
+            .saturating_add(CHANNEL_GROUP_STEP)
+            .min(MAX_VOLUME),
+        ChannelGroupAction::Decrease => current_max.saturating_sub(CHANNEL_GROUP_STEP),
+        ChannelGroupAction::ToggleMute => current_max,
+    };
+
+    current
+        .iter()
+        .map(|(name, volume)| {
+            let scaled = if current_max == 0 {
+                if action == ChannelGroupAction::Increase {
+                    CHANNEL_GROUP_STEP
+                } else {
+                    0
+                }
+            } else {
+                let numerator =
+                    u16::from(*volume) * u16::from(target_max) + u16::from(current_max) / 2;
+                (numerator / u16::from(current_max)) as u8
+            };
+            (name.clone(), scaled.min(MAX_VOLUME))
+        })
+        .collect()
+}
+
+fn apply_channel_volumes(
+    state: &AppState,
+    current: &[(String, u8)],
+    target: &[(String, u8)],
+) -> Result<(), String> {
+    let mut applied: Vec<(String, u8)> = Vec::new();
+    for ((name, previous), (_, next)) in current.iter().zip(target) {
+        if previous == next {
+            continue;
+        }
+        if let Err(error) = state.backend.set_sink_volume(name, *next) {
+            for (applied_name, applied_previous) in applied.into_iter().rev() {
+                let _ = state
+                    .backend
+                    .set_sink_volume(&applied_name, applied_previous);
+            }
+            return Err(error.to_string());
+        }
+        applied.push((name.clone(), *previous));
+    }
+    Ok(())
+}
+
+fn apply_channel_mutes(
+    state: &AppState,
+    current: &[(String, bool)],
+    target: &[(String, bool)],
+) -> Result<(), String> {
+    let mut applied: Vec<(String, bool)> = Vec::new();
+    for ((name, previous), (_, next)) in current.iter().zip(target) {
+        if previous == next {
+            continue;
+        }
+        if let Err(error) = state.backend.set_sink_mute(name, *next) {
+            for (applied_name, applied_previous) in applied.into_iter().rev() {
+                let _ = state.backend.set_sink_mute(&applied_name, applied_previous);
+            }
+            return Err(error.to_string());
+        }
+        applied.push((name.clone(), *previous));
+    }
+    Ok(())
+}
+
+pub fn apply_channel_group_action(
+    state: &AppState,
+    action: ChannelGroupAction,
+) -> Result<ChannelGroupResult, String> {
+    let _gate = state
+        .channel_group_gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    match action {
+        ChannelGroupAction::Increase | ChannelGroupAction::Decrease => {
+            let (initialized, current, muted) = {
+                let mixer = state.lock_mixer()?;
+                (
+                    mixer.initialized,
+                    mixer
+                        .channels
+                        .iter()
+                        .map(|channel| (channel.name.clone(), channel.volume_percent))
+                        .collect::<Vec<_>>(),
+                    mixer.channels.iter().all(|channel| channel.muted),
+                )
+            };
+            if !initialized || current.is_empty() {
+                return Err("Sink channels are not ready".to_string());
+            }
+            let target = scaled_channel_volumes(&current, action);
+            apply_channel_volumes(state, &current, &target)?;
+
+            let defs = {
+                let mut mixer = state.lock_mixer()?;
+                for (name, volume) in &target {
+                    if let Some(channel) = mixer.channel_mut(name) {
+                        channel.volume_percent = *volume;
+                    }
+                    mixer.channel_defs.set_volume(name, *volume);
+                }
+                crate::commands::profiles::autosave_active(&mixer);
+                mixer.channel_defs.clone()
+            };
+            defs.save().map_err(|error| error.to_string())?;
+            Ok(ChannelGroupResult {
+                level_percent: target.iter().map(|(_, volume)| *volume).max().unwrap_or(0),
+                muted,
+            })
+        }
+        ChannelGroupAction::ToggleMute => {
+            let (initialized, current, level_percent) = {
+                let mixer = state.lock_mixer()?;
+                (
+                    mixer.initialized,
+                    mixer
+                        .channels
+                        .iter()
+                        .map(|channel| (channel.name.clone(), channel.muted))
+                        .collect::<Vec<_>>(),
+                    mixer
+                        .channels
+                        .iter()
+                        .map(|channel| channel.volume_percent)
+                        .max()
+                        .unwrap_or(0),
+                )
+            };
+            if !initialized || current.is_empty() {
+                return Err("Sink channels are not ready".to_string());
+            }
+
+            let current_map = current.iter().cloned().collect::<HashMap<_, _>>();
+            let previous_restore = state
+                .channel_group_mute_restore
+                .lock()
+                .map_err(|_| "channel group mute lock poisoned".to_string())?
+                .clone();
+            let (target, next_restore) = if let Some(restore) = previous_restore {
+                (
+                    current
+                        .iter()
+                        .map(|(name, _)| {
+                            (name.clone(), restore.get(name).copied().unwrap_or(false))
+                        })
+                        .collect::<Vec<_>>(),
+                    None,
+                )
+            } else if current.iter().all(|(_, muted)| *muted) {
+                (
+                    current
+                        .iter()
+                        .map(|(name, _)| (name.clone(), false))
+                        .collect(),
+                    None,
+                )
+            } else {
+                (
+                    current
+                        .iter()
+                        .map(|(name, _)| (name.clone(), true))
+                        .collect(),
+                    Some(current_map),
+                )
+            };
+            apply_channel_mutes(state, &current, &target)?;
+
+            let defs = {
+                let mut mixer = state.lock_mixer()?;
+                for (name, muted) in &target {
+                    if let Some(channel) = mixer.channel_mut(name) {
+                        channel.muted = *muted;
+                    }
+                    mixer.channel_defs.set_muted(name, *muted);
+                }
+                crate::commands::profiles::autosave_active(&mixer);
+                mixer.channel_defs.clone()
+            };
+            *state
+                .channel_group_mute_restore
+                .lock()
+                .map_err(|_| "channel group mute lock poisoned".to_string())? = next_restore;
+            defs.save().map_err(|error| error.to_string())?;
+            Ok(ChannelGroupResult {
+                level_percent,
+                muted: target.iter().all(|(_, muted)| *muted),
+            })
+        }
+    }
+}
 
 /// An app's other live streams: same identity, different stream. Routing is
 /// per app, so these move with the one the user clicked.
@@ -148,6 +377,10 @@ pub fn toggle_channel_mute(
         crate::commands::profiles::autosave_active(&mixer);
         mixer.channel_defs.clone()
     };
+    *state
+        .channel_group_mute_restore
+        .lock()
+        .map_err(|_| "channel group mute lock poisoned".to_string())? = None;
     defs.save().map_err(|e| e.to_string())
 }
 
@@ -209,7 +442,7 @@ pub fn set_app_volume(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::mock::{stream as mock_stream, MockBackend};
+    use crate::audio::mock::{stream as mock_stream, Call, MockBackend};
     use crate::audio::types::AppStream;
     use crate::persistence::testing::TempConfig;
     use std::sync::Arc;
@@ -351,5 +584,143 @@ mod tests {
         assert_eq!(indices, vec![2], "only same-identity streams, never itself");
 
         assert!(siblings_of(&streams, &streams[2]).is_empty());
+    }
+
+    #[test]
+    fn channel_group_cli_flags_are_narrow() {
+        assert_eq!(
+            channel_group_action_from_args(&["sink".into(), "--channels-volume-up".into()]),
+            Some(ChannelGroupAction::Increase)
+        );
+        assert_eq!(
+            channel_group_action_from_args(&["sink".into(), "--channels-volume-down".into()]),
+            Some(ChannelGroupAction::Decrease)
+        );
+        assert_eq!(
+            channel_group_action_from_args(&["sink".into(), "--channels-volume-mute".into()]),
+            Some(ChannelGroupAction::ToggleMute)
+        );
+        assert_eq!(
+            channel_group_action_from_args(&["sink".into(), "--minimized".into()]),
+            None
+        );
+    }
+
+    #[test]
+    fn grouped_volume_preserves_channel_ratios_across_a_step() {
+        let current = vec![
+            ("sink_game".to_string(), 100),
+            ("sink_chat".to_string(), 60),
+            ("sink_music".to_string(), 40),
+            ("sink_system".to_string(), 0),
+        ];
+        let down = scaled_channel_volumes(&current, ChannelGroupAction::Decrease);
+        assert_eq!(
+            down,
+            vec![
+                ("sink_game".to_string(), 95),
+                ("sink_chat".to_string(), 57),
+                ("sink_music".to_string(), 38),
+                ("sink_system".to_string(), 0),
+            ]
+        );
+        assert_eq!(
+            scaled_channel_volumes(&down, ChannelGroupAction::Increase),
+            current
+        );
+    }
+
+    #[test]
+    fn grouped_volume_updates_backend_memory_and_persistence() {
+        let cfg = TempConfig::new("channel-group-volume");
+        let backend = Arc::new(MockBackend::default());
+        let state = app(backend.clone());
+        {
+            let mut mixer = state.lock_mixer().expect("mixer");
+            for (name, volume) in [
+                ("sink_game", 100),
+                ("sink_chat", 60),
+                ("sink_music", 40),
+                ("sink_system", 0),
+            ] {
+                mixer.channel_mut(name).expect("channel").volume_percent = volume;
+                mixer.channel_defs.set_volume(name, volume);
+            }
+        }
+
+        let result = apply_channel_group_action(&state, ChannelGroupAction::Decrease)
+            .expect("group volume applies");
+        assert_eq!(result.level_percent, 95);
+        let mixer = state.lock_mixer().expect("mixer");
+        let volumes = mixer
+            .channels
+            .iter()
+            .map(|channel| channel.volume_percent)
+            .collect::<Vec<_>>();
+        assert_eq!(volumes, vec![95, 57, 38, 0]);
+        drop(mixer);
+
+        let calls = backend.calls();
+        assert!(calls.contains(&Call::SetSinkVolume {
+            name: "sink_game".into(),
+            percent: 95,
+        }));
+        assert!(calls.contains(&Call::SetSinkVolume {
+            name: "sink_chat".into(),
+            percent: 57,
+        }));
+        assert!(calls.contains(&Call::SetSinkVolume {
+            name: "sink_music".into(),
+            percent: 38,
+        }));
+        assert_eq!(
+            crate::persistence::channels::Channels::load()
+                .get("sink_chat")
+                .expect("persisted channel")
+                .volume_percent,
+            57
+        );
+        drop(cfg);
+    }
+
+    #[test]
+    fn group_mute_restores_each_channels_previous_state() {
+        let _cfg = TempConfig::new("channel-group-mute");
+        let backend = Arc::new(MockBackend::default());
+        let state = app(backend);
+        {
+            let mut mixer = state.lock_mixer().expect("mixer");
+            mixer.channel_mut("sink_chat").expect("chat").muted = true;
+            mixer.channel_defs.set_muted("sink_chat", true);
+        }
+
+        let muted = apply_channel_group_action(&state, ChannelGroupAction::ToggleMute)
+            .expect("group mute applies");
+        assert!(muted.muted);
+        assert!(state
+            .lock_mixer()
+            .expect("mixer")
+            .channels
+            .iter()
+            .all(|channel| channel.muted));
+
+        let restored = apply_channel_group_action(&state, ChannelGroupAction::ToggleMute)
+            .expect("group mute restores");
+        assert!(!restored.muted);
+        let mixer = state.lock_mixer().expect("mixer");
+        let states = mixer
+            .channels
+            .iter()
+            .map(|channel| (channel.name.as_str(), channel.muted))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            states,
+            vec![
+                ("sink_game", false),
+                ("sink_chat", true),
+                ("sink_music", false),
+                ("sink_system", false),
+            ]
+        );
     }
 }

@@ -257,6 +257,7 @@ pub fn init_virtual_devices(
         }
     }
     // Profiles/active state may have changed since the tray was built.
+    state.hardware.mark_audio_ready();
     crate::refresh_tray(&app);
     Ok(())
 }

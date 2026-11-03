@@ -7,10 +7,12 @@
 //! to receive dial and wireless-status reports. It never writes EQ, sidetone,
 //! gain, auto-off, microphone, or other persistent headset settings.
 
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -56,6 +58,7 @@ impl Default for ArctisStatus {
 /// that may currently be in reconnect backoff.
 pub struct HardwareRuntime {
     status: Mutex<ArctisStatus>,
+    audio_ready: AtomicBool,
     wake_generation: Mutex<u64>,
     wake: Condvar,
 }
@@ -64,6 +67,7 @@ impl Default for HardwareRuntime {
     fn default() -> Self {
         Self {
             status: Mutex::new(ArctisStatus::default()),
+            audio_ready: AtomicBool::new(false),
             wake_generation: Mutex::new(0),
             wake: Condvar::new(),
         }
@@ -80,6 +84,20 @@ impl HardwareRuntime {
             *generation = generation.wrapping_add(1);
             self.wake.notify_all();
         }
+    }
+
+    pub fn mark_audio_ready(&self) {
+        self.audio_ready.store(true, Ordering::Release);
+        self.notify_settings_changed();
+    }
+
+    pub fn mark_audio_unready(&self) {
+        self.audio_ready.store(false, Ordering::Release);
+        self.notify_settings_changed();
+    }
+
+    fn audio_ready(&self) -> bool {
+        self.audio_ready.load(Ordering::Acquire)
     }
 
     fn wait(&self, duration: Duration) {
@@ -112,6 +130,7 @@ struct WorkerPrefs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AutoSwitchAction {
     None,
+    Prime,
     Claim,
     Release(Option<String>),
 }
@@ -123,12 +142,21 @@ enum AutoSwitchAction {
 struct AutoSwitchState {
     observed_online: Option<bool>,
     previous_default: Option<String>,
+    output_claims: HashMap<String, OutputClaim>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutputClaim {
+    claimed: String,
+    restore: Option<String>,
+    saved: Option<String>,
 }
 
 impl AutoSwitchState {
     fn reset_observation(&mut self) {
         self.observed_online = None;
         self.previous_default = None;
+        self.output_claims.clear();
     }
 
     fn observe(
@@ -139,7 +167,11 @@ impl AutoSwitchState {
         controlled: &[String],
     ) -> AutoSwitchAction {
         let Some(previous_online) = self.observed_online.replace(online) else {
-            return AutoSwitchAction::None;
+            return if online && enabled {
+                AutoSwitchAction::Prime
+            } else {
+                AutoSwitchAction::None
+            };
         };
         if previous_online == online {
             return AutoSwitchAction::None;
@@ -157,12 +189,49 @@ impl AutoSwitchState {
             let restore = current_default
                 .filter(|name| controlled.iter().any(|candidate| candidate == name))
                 .and_then(|_| self.previous_default.take());
-            // Always release the temporary Balance A/B output claim. The
+            // Always release the temporary per-channel output claims. The
             // previous system default is optional because a manual default
             // change must still be preserved.
             self.previous_default = None;
             AutoSwitchAction::Release(restore)
         }
+    }
+}
+
+fn restore_output_for_claim(
+    saved: Option<&str>,
+    resolved: Option<&str>,
+    claimed: &str,
+    alternate: Option<&str>,
+) -> Option<String> {
+    saved.map(str::to_string).or_else(|| match resolved {
+        Some(current) if current != claimed => Some(current.to_string()),
+        _ => alternate.map(str::to_string),
+    })
+}
+
+fn auto_switch_output_plan(
+    controlled: &[String],
+    saved_outputs: &HashMap<String, Option<String>>,
+    target: Option<&str>,
+) -> Vec<(String, Option<String>, Option<String>)> {
+    controlled
+        .iter()
+        .map(|name| {
+            let saved = saved_outputs.get(name).cloned().flatten();
+            let claimed = target.map(str::to_string).or_else(|| saved.clone());
+            (name.clone(), saved, claimed)
+        })
+        .collect()
+}
+
+fn should_restore_claim(current: Option<Option<&str>>, claimed: &str) -> bool {
+    match current {
+        // Backends without resolved-output reporting cannot provide the
+        // second guard; the persisted-setting guard still applies.
+        None => true,
+        Some(Some(name)) => name == claimed,
+        Some(None) => false,
     }
 }
 
@@ -532,21 +601,76 @@ fn apply_auto_switch(app: &tauri::AppHandle, machine: &mut AutoSwitchState, onli
         .and_then(|(output, _)| output);
     match machine.observe(online, prefs.auto_switch, current.as_deref(), &controlled) {
         AutoSwitchAction::None => {}
+        AutoSwitchAction::Prime => {
+            let Some(target) = prefs.output.as_deref() else {
+                return;
+            };
+            if controlled.is_empty() {
+                return;
+            }
+            let saved_outputs = {
+                let Ok(mixer) = state.lock_mixer() else {
+                    return;
+                };
+                auto_switch_output_plan(
+                    &controlled,
+                    &mixer.outputs.outputs,
+                    prefs.output.as_deref(),
+                )
+            };
+            let resolved = state.backend.resolved_channel_outputs().unwrap_or_default();
+            machine.output_claims.clear();
+            for (name, saved, _) in saved_outputs {
+                let Some(current) = resolved.get(&name).and_then(|value| value.as_deref()) else {
+                    continue;
+                };
+                if current != target {
+                    continue;
+                }
+                let alternate = if saved.is_none() {
+                    state.backend.preferred_output_excluding(target).ok().flatten()
+                } else {
+                    None
+                };
+                let restore = restore_output_for_claim(
+                    saved.as_deref(),
+                    Some(current),
+                    target,
+                    alternate.as_deref(),
+                );
+                machine.output_claims.insert(
+                    name,
+                    OutputClaim {
+                        claimed: target.to_string(),
+                        restore,
+                        saved,
+                    },
+                );
+            }
+        }
         AutoSwitchAction::Release(previous) => {
-            // Hardware claims are deliberately transient: `Claim` changes
-            // the live PipeWire links without replacing the user's saved
-            // per-channel choices. Restore every channel on disconnect, not
-            // just the current Balance pair: a channel that used to be A/B
-            // must not retain a stale headset target after the pair changes.
-            let saved_outputs = state.lock_mixer().map(|mixer| {
-                controlled
-                    .iter()
+            let current_outputs = state.backend.resolved_channel_outputs().unwrap_or_default();
+            let current_saved = state.lock_mixer().map(|mixer| {
+                machine
+                    .output_claims
+                    .keys()
                     .map(|name| (name.clone(), mixer.outputs.get(name).map(str::to_string)))
-                    .collect::<Vec<_>>()
+                    .collect::<HashMap<_, _>>()
             });
-            if let Ok(saved_outputs) = saved_outputs {
-                for (name, output) in saved_outputs {
-                    if let Err(e) = state.backend.set_channel_output(&name, output.as_deref()) {
+            let claims = std::mem::take(&mut machine.output_claims);
+            if let Ok(current_saved) = current_saved {
+                for (name, claim) in claims {
+                    if current_saved.get(&name) != Some(&claim.saved) {
+                        continue;
+                    }
+                    let current = current_outputs.get(&name).map(|value| value.as_deref());
+                    if !should_restore_claim(current, &claim.claimed) {
+                        continue;
+                    }
+                    if let Err(e) = state
+                        .backend
+                        .set_channel_output(&name, claim.restore.as_deref())
+                    {
                         eprintln!("sink: releasing ChatMix output for {name} failed: {e}");
                     }
                 }
@@ -558,29 +682,64 @@ fn apply_auto_switch(app: &tauri::AppHandle, machine: &mut AutoSwitchState, onli
             }
         }
         AutoSwitchAction::Claim => {
-            let Some((a, b)) = balance_pair(app) else {
+            let Some(fallback_channel) = controlled.first().cloned() else {
                 return;
             };
-            let (a_output, b_output, game_channel) = {
+            let (outputs, game_channel) = {
                 let Ok(mixer) = state.lock_mixer() else {
                     return;
                 };
-                let target = prefs.output.as_deref();
                 (
-                    target.or_else(|| mixer.outputs.get(&a)).map(str::to_string),
-                    target.or_else(|| mixer.outputs.get(&b)).map(str::to_string),
+                    auto_switch_output_plan(
+                        &controlled,
+                        &mixer.outputs.outputs,
+                        prefs.output.as_deref(),
+                    ),
                     mixer
                         .channel_defs
                         .get("sink_game")
                         .map(|_| "sink_game".to_string())
-                        .unwrap_or_else(|| a.clone()),
+                        .unwrap_or(fallback_channel),
                 )
             };
-            if let Err(e) = state.backend.set_channel_output(&a, a_output.as_deref()) {
-                eprintln!("sink: activating ChatMix output for {a} failed: {e}");
-            }
-            if let Err(e) = state.backend.set_channel_output(&b, b_output.as_deref()) {
-                eprintln!("sink: activating ChatMix output for {b} failed: {e}");
+            let resolved = state.backend.resolved_channel_outputs().unwrap_or_default();
+            machine.output_claims.clear();
+            for (name, saved, claimed) in outputs {
+                let alternate = claimed.as_deref().and_then(|target| {
+                    (saved.is_none()
+                        && resolved
+                            .get(&name)
+                            .and_then(|value| value.as_deref())
+                            .map_or(true, |current| current == target))
+                    .then(|| {
+                        state
+                            .backend
+                            .preferred_output_excluding(target)
+                            .ok()
+                            .flatten()
+                    })
+                    .flatten()
+                });
+                let restore = claimed.as_deref().and_then(|target| {
+                    restore_output_for_claim(
+                        saved.as_deref(),
+                        resolved.get(&name).and_then(|value| value.as_deref()),
+                        target,
+                        alternate.as_deref(),
+                    )
+                });
+                if let Err(e) = state.backend.set_channel_output(&name, claimed.as_deref()) {
+                    eprintln!("sink: activating ChatMix output for {name} failed: {e}");
+                } else if let Some(claimed) = claimed {
+                    machine.output_claims.insert(
+                        name,
+                        OutputClaim {
+                            claimed,
+                            restore,
+                            saved,
+                        },
+                    );
+                }
             }
             if let Err(e) = state.backend.set_default_output(&game_channel) {
                 eprintln!("sink: setting the Game channel as default failed: {e}");
@@ -629,6 +788,9 @@ fn run_device_session(
             output: None,
         });
         if !prefs.enabled {
+            return Ok(());
+        }
+        if !runtime.audio_ready() {
             return Ok(());
         }
 
@@ -718,6 +880,19 @@ fn worker_loop(app: tauri::AppHandle, runtime: Arc<HardwareRuntime>) {
             auto_switch.reset_observation();
             set_status(&app, &runtime, ArctisConnectionState::Disabled, None);
             runtime.wait(Duration::from_secs(30));
+            backoff = Duration::from_secs(1);
+            continue;
+        }
+
+        if !runtime.audio_ready() {
+            auto_switch.reset_observation();
+            set_status(
+                &app,
+                &runtime,
+                ArctisConnectionState::Disconnected,
+                Some("Waiting for Sink's virtual audio devices".into()),
+            );
+            runtime.wait(Duration::from_secs(1));
             backoff = Duration::from_secs(1);
             continue;
         }
@@ -831,14 +1006,53 @@ mod tests {
     }
 
     #[test]
-    fn first_observation_never_switches_outputs() {
+    fn autoswitch_plan_claims_every_configured_channel() {
+        let controlled = ["sink_game", "sink_chat", "sink_music", "sink_system"]
+            .map(str::to_string);
+        let saved_outputs = HashMap::from([
+            ("sink_game".to_string(), None),
+            ("sink_chat".to_string(), Some("speakers".to_string())),
+            ("sink_music".to_string(), None),
+            ("sink_system".to_string(), Some("hdmi".to_string())),
+        ]);
+
+        let plan = auto_switch_output_plan(
+            &controlled,
+            &saved_outputs,
+            Some("alsa_output.arctis"),
+        );
+
+        assert_eq!(plan.len(), controlled.len());
+        assert_eq!(
+            plan.iter().map(|(name, _, _)| name).collect::<Vec<_>>(),
+            controlled.iter().collect::<Vec<_>>()
+        );
+        assert!(plan
+            .iter()
+            .all(|(_, _, claimed)| claimed.as_deref() == Some("alsa_output.arctis")));
+        assert_eq!(plan[1].1.as_deref(), Some("speakers"));
+        assert_eq!(plan[3].1.as_deref(), Some("hdmi"));
+    }
+
+    #[test]
+    fn first_online_observation_only_primes_restore_state() {
         let mut state = AutoSwitchState::default();
         let controlled = vec!["sink_game".to_string(), "sink_chat".to_string()];
         assert_eq!(
             state.observe(true, true, Some("speakers"), &controlled),
-            AutoSwitchAction::None
+            AutoSwitchAction::Prime
         );
         assert_eq!(state.previous_default, None);
+    }
+
+    #[test]
+    fn first_offline_observation_does_nothing() {
+        let mut state = AutoSwitchState::default();
+        let controlled = vec!["sink_game".to_string(), "sink_chat".to_string()];
+        assert_eq!(
+            state.observe(false, true, Some("speakers"), &controlled),
+            AutoSwitchAction::None
+        );
     }
 
     #[test]
@@ -874,5 +1088,44 @@ mod tests {
             state.observe(false, true, Some("usb_dac"), &controlled),
             AutoSwitchAction::Release(None)
         );
+    }
+
+    #[test]
+    fn follow_default_restores_an_alternate_when_target_won_fallback() {
+        assert_eq!(
+            restore_output_for_claim(
+                None,
+                Some("alsa_output.arctis"),
+                "alsa_output.arctis",
+                Some("alsa_output.speakers"),
+            ),
+            Some("alsa_output.speakers".into())
+        );
+    }
+
+    #[test]
+    fn explicit_output_is_restored_exactly() {
+        assert_eq!(
+            restore_output_for_claim(
+                Some("easyeffects_sink"),
+                Some("alsa_output.speakers"),
+                "alsa_output.arctis",
+                Some("alsa_output.speakers"),
+            ),
+            Some("easyeffects_sink".into())
+        );
+    }
+
+    #[test]
+    fn release_only_restores_a_route_still_owned_by_hardware() {
+        assert!(should_restore_claim(
+            Some(Some("alsa_output.arctis")),
+            "alsa_output.arctis"
+        ));
+        assert!(!should_restore_claim(
+            Some(Some("alsa_output.speakers")),
+            "alsa_output.arctis"
+        ));
+        assert!(should_restore_claim(None, "alsa_output.arctis"));
     }
 }

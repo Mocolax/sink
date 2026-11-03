@@ -16,6 +16,8 @@ use crate::error::SinkError;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Call {
     MoveStream { index: u32, sink: String },
+    SetSinkVolume { name: String, percent: u8 },
+    SetSinkMute { name: String, muted: bool },
     ListStreams,
     Other(&'static str),
 }
@@ -127,13 +129,19 @@ impl AudioBackend for MockBackend {
         Ok(Vec::new())
     }
 
-    fn set_sink_volume(&self, _sink_name: &str, _volume_percent: u8) -> Result<(), SinkError> {
-        self.record(Call::Other("set_sink_volume"));
+    fn set_sink_volume(&self, sink_name: &str, volume_percent: u8) -> Result<(), SinkError> {
+        self.record(Call::SetSinkVolume {
+            name: sink_name.to_string(),
+            percent: volume_percent,
+        });
         Ok(())
     }
 
-    fn set_sink_mute(&self, _sink_name: &str, _muted: bool) -> Result<(), SinkError> {
-        self.record(Call::Other("set_sink_mute"));
+    fn set_sink_mute(&self, sink_name: &str, muted: bool) -> Result<(), SinkError> {
+        self.record(Call::SetSinkMute {
+            name: sink_name.to_string(),
+            muted,
+        });
         Ok(())
     }
 

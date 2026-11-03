@@ -18,7 +18,77 @@ use audio::backend::AudioBackend;
 use audio::pactl::PactlBackend;
 use audio::pw_native::levels::LevelStore;
 use audio::pw_native::PipeWireBackend;
+use commands::routing::{ChannelGroupAction, ChannelGroupResult};
 use state::AppState;
+
+const CHANNEL_ACTION_READY_RETRIES: u8 = 50;
+
+fn show_channel_group_osd(result: ChannelGroupResult) {
+    #[cfg(target_os = "linux")]
+    {
+        let displayed = if result.muted {
+            0
+        } else {
+            result.level_percent
+        }
+        .to_string();
+        let maximum = commands::routing::MAX_VOLUME.to_string();
+        let status = std::process::Command::new("qdbus6")
+            .args([
+                "org.kde.plasmashell",
+                "/org/kde/osdService",
+                "org.kde.osdService.volumeChanged",
+                displayed.as_str(),
+                maximum.as_str(),
+            ])
+            .status();
+        match status {
+            Ok(status) if !status.success() => {
+                eprintln!("sink: showing the channel volume OSD exited with {status}");
+            }
+            Err(error) => eprintln!("sink: showing the channel volume OSD failed: {error}"),
+            Ok(_) => {}
+        }
+    }
+}
+
+fn apply_channel_group_action(app: &tauri::AppHandle, action: ChannelGroupAction) {
+    match commands::routing::apply_channel_group_action(app.state::<AppState>().inner(), action) {
+        Ok(result) => {
+            let _ = app.emit("channel-group-changed", result);
+            show_channel_group_osd(result);
+        }
+        Err(error) => eprintln!("sink: channel group action failed: {error}"),
+    }
+}
+
+fn dispatch_channel_group_action(app: tauri::AppHandle, action: ChannelGroupAction) {
+    let ready = app
+        .state::<AppState>()
+        .lock_mixer()
+        .map(|mixer| mixer.initialized)
+        .unwrap_or(false);
+    if ready {
+        apply_channel_group_action(&app, action);
+        return;
+    }
+
+    std::thread::spawn(move || {
+        for _ in 0..CHANNEL_ACTION_READY_RETRIES {
+            let ready = app
+                .state::<AppState>()
+                .lock_mixer()
+                .map(|mixer| mixer.initialized)
+                .unwrap_or(false);
+            if ready {
+                apply_channel_group_action(&app, action);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        eprintln!("sink: channel group action timed out waiting for virtual sinks");
+    });
+}
 
 pub fn run() {
     // Prefer the native PipeWire backend (Phase 2); fall back to pactl
@@ -43,7 +113,11 @@ pub fn run() {
         // focuses the running window instead of spawning a duplicate - two
         // instances would create clashing virtual sinks and fight over the
         // audio graph. Sink hides to tray, so unhide + focus the existing one.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if let Some(action) = commands::routing::channel_group_action_from_args(&argv) {
+                dispatch_channel_group_action(app.clone(), action);
+                return;
+            }
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.unminimize();
@@ -127,9 +201,12 @@ pub fn run() {
         ])
         .setup(move |app| {
             build_tray(app)?;
+            let args = std::env::args().collect::<Vec<_>>();
+            let channel_group_action = commands::routing::channel_group_action_from_args(&args);
             // The window starts hidden (config) to avoid a flash; show it
             // now unless launched with --minimized (autostart-to-tray).
-            let minimized = std::env::args().any(|a| a == "--minimized");
+            let minimized =
+                args.iter().any(|arg| arg == "--minimized") || channel_group_action.is_some();
             if !minimized {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.show();
@@ -140,6 +217,9 @@ pub fn run() {
             }
             spawn_route_enforcer(app.handle().clone());
             hardware::spawn(app.handle().clone());
+            if let Some(action) = channel_group_action {
+                dispatch_channel_group_action(app.handle().clone(), action);
+            }
             Ok(())
         })
         // Close button hides to tray instead of quitting - main window

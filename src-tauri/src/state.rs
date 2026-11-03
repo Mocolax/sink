@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -14,6 +15,13 @@ pub struct AppState {
     /// already polling (see `lib::spawn_route_enforcer`).
     ui_stream_poll: Mutex<Option<Instant>>,
     pub refresh_gate: Mutex<()>,
+    /// Serializes keyboard-wide channel actions so key repeat cannot race two
+    /// read/scale/persist cycles against each other.
+    pub channel_group_gate: Mutex<()>,
+    /// Per-channel mute state captured by the keyboard group-mute action.
+    /// Runtime-only by design: after a restart, an all-muted set toggles back
+    /// to all-unmuted instead of trusting a stale restoration snapshot.
+    pub channel_group_mute_restore: Mutex<Option<HashMap<String, bool>>>,
     /// Long-lived hardware worker state. The worker itself is spawned during
     /// Tauri setup and remains active while the app is hidden in the tray.
     pub hardware: Arc<crate::hardware::HardwareRuntime>,
@@ -83,6 +91,8 @@ impl AppState {
             mixer: Mutex::new(mixer),
             ui_stream_poll: Mutex::new(None),
             refresh_gate: Mutex::new(()),
+            channel_group_gate: Mutex::new(()),
+            channel_group_mute_restore: Mutex::new(None),
             hardware: Arc::new(crate::hardware::HardwareRuntime::default()),
         }
     }
@@ -91,6 +101,7 @@ impl AppState {
     /// instead of aborting on the first failure so a single bad unload
     /// doesn't leave the remaining sinks behind.
     pub fn teardown_virtual_sinks(&self) -> Vec<String> {
+        self.hardware.mark_audio_unready();
         let names: Vec<String> = self
             .mixer
             .lock()
@@ -107,6 +118,9 @@ impl AppState {
             // poll only writes on structural changes).
             let _ = mixer.seen.save();
             mixer.reset();
+        }
+        if let Ok(mut restore) = self.channel_group_mute_restore.lock() {
+            *restore = None;
         }
         errors
     }

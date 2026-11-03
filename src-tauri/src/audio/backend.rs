@@ -1,4 +1,4 @@
-use crate::audio::types::{AppStream, EqConfig, MicConfig, OutputDevice};
+use crate::audio::types::{is_virtual_sink, AppStream, EqConfig, MicConfig, OutputDevice};
 use crate::error::SinkError;
 
 /// Abstraction over the underlying audio system.
@@ -56,6 +56,26 @@ pub trait AudioBackend: Send + Sync {
         &self,
     ) -> Result<std::collections::HashMap<String, Option<String>>, SinkError> {
         Ok(std::collections::HashMap::new())
+    }
+
+    /// Best available real output other than `excluded`. The native backend
+    /// overrides this to reuse WirePlumber's session priorities. The generic
+    /// implementation gives subprocess/fake backends a deterministic fallback.
+    fn preferred_output_excluding(&self, excluded: &str) -> Result<Option<String>, SinkError> {
+        let default = self.get_default_devices()?.0;
+        if default
+            .as_deref()
+            .is_some_and(|name| name != excluded && !is_virtual_sink(name))
+        {
+            return Ok(default);
+        }
+
+        let mut outputs = self.list_output_devices()?;
+        outputs.sort_by_key(|output| output.index);
+        Ok(outputs
+            .into_iter()
+            .find(|output| output.name != excluded && !is_virtual_sink(&output.name))
+            .map(|output| output.name))
     }
 
     /// Create a mix bus: a capturable virtual source whose label is the

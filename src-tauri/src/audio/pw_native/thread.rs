@@ -46,6 +46,7 @@ pub enum Cmd {
     ListStreams { reply: Reply<Vec<AppStream>> },
     ListOutputs { reply: Reply<Vec<OutputDevice>> },
     ResolvedOutputs { reply: Reply<HashMap<String, Option<String>>> },
+    PreferredOutputExcluding { excluded: String, reply: Reply<Option<String>> },
     SetNodeVolumeByName { name: String, percent: u8, reply: Reply<()> },
     SetNodeMuteByName { name: String, muted: bool, reply: Reply<()> },
     SetNodeVolumeById { id: u32, percent: u8, reply: Reply<()> },
@@ -801,9 +802,12 @@ fn desired_pairs(s: &State, channel_id: u32, target_id: u32) -> Vec<(u32, u32)> 
 /// candidates. Pure (plain tuples) so the failover choice is unit-testable,
 /// and it reuses WirePlumber's own scoring so Sink's fallback matches the
 /// device the OS would pick, consistently across distros.
-fn pick_fallback_sink<'a>(candidates: impl Iterator<Item = (u32, &'a str, i64)>) -> Option<u32> {
+fn pick_fallback_sink<'a>(
+    candidates: impl Iterator<Item = (u32, &'a str, i64)>,
+    excluded: Option<&str>,
+) -> Option<u32> {
     candidates
-        .filter(|(_, name, _)| !is_virtual_sink(name))
+        .filter(|(_, name, _)| !is_virtual_sink(name) && excluded != Some(*name))
         .max_by_key(|&(_, _, priority)| priority)
         .map(|(id, _, _)| id)
 }
@@ -827,6 +831,7 @@ fn fallback_sink(s: &State) -> Option<u32> {
                         .unwrap_or(0),
                 )
             }),
+        None,
     )
 }
 
@@ -1388,6 +1393,29 @@ fn handle_cmd(state: &Rc<RefCell<State>>, registry: &RegistryRc, cmd: Cmd) {
                 .collect();
             let _ = reply.send(Ok(resolved));
         }
+        Cmd::PreferredOutputExcluding { excluded, reply } => {
+            let s = state.borrow();
+            let preferred = pick_fallback_sink(
+                s.nodes
+                    .values()
+                    .filter(|n| n.media_class == SINK_CLASS)
+                    .map(|n| {
+                        (
+                            n.id,
+                            n.props.get("node.name").map(String::as_str).unwrap_or(""),
+                            n.props
+                                .get("priority.session")
+                                .and_then(|p| p.parse::<i64>().ok())
+                                .unwrap_or(0),
+                        )
+                    }),
+                Some(&excluded),
+            )
+            .and_then(|id| s.nodes.get(&id))
+            .and_then(|node| node.props.get("node.name"))
+            .cloned();
+            let _ = reply.send(Ok(preferred));
+        }
         Cmd::SetNodeVolumeByName { name, percent, reply } => {
             let s = state.borrow();
             let _ = reply.send(set_props(s.node_by_name(&name), Some(percent), None));
@@ -1910,7 +1938,20 @@ mod tests {
             (3, "alsa_output.analog", 900),
             (4, "alsa_output.usb", 700),
         ];
-        assert_eq!(pick_fallback_sink(candidates.into_iter()), Some(3));
+        assert_eq!(pick_fallback_sink(candidates.into_iter(), None), Some(3));
+    }
+
+    #[test]
+    fn fallback_can_exclude_the_wireless_target() {
+        let candidates = [
+            (1u32, "sink_game", 10_000i64),
+            (2, "alsa_output.speakers", 1_000),
+            (3, "alsa_output.arctis", 1_109),
+        ];
+        assert_eq!(
+            pick_fallback_sink(candidates.into_iter(), Some("alsa_output.arctis")),
+            Some(2)
+        );
     }
 
     #[test]
@@ -1937,6 +1978,6 @@ mod tests {
         // (sink_mic/sink_stream are sources, excluded by media_class before
         // reaching here - so they're not exercised at this layer.)
         let candidates = [(1u32, "sink_game", 0i64), (2, "sink_chat", 0)];
-        assert_eq!(pick_fallback_sink(candidates.into_iter()), None);
+        assert_eq!(pick_fallback_sink(candidates.into_iter(), None), None);
     }
 }

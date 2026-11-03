@@ -19,6 +19,7 @@ export function useAudio() {
   const fetchAppStreams = useMixerStore((s) => s.fetchAppStreams);
   const fetchOutputs = useMixerStore((s) => s.fetchOutputs);
   const fetchSeenApps = useMixerStore((s) => s.fetchSeenApps);
+  const fetchChannels = useMixerStore((s) => s.fetchChannels);
   const setLevels = useMixerStore((s) => s.setLevels);
   const applyHardwareChatMix = useMixerStore((s) => s.applyHardwareChatMix);
   const outputDevices = useMixerStore((s) => s.outputDevices);
@@ -76,6 +77,18 @@ export function useAudio() {
       void unlisten.then((fn) => fn());
     };
   }, [applyHardwareChatMix]);
+
+  // Keyboard-wide volume actions run in the Rust process even while the main
+  // window is hidden. Refresh once per key event so every visible slider stays
+  // in sync with the values already applied and persisted by the backend.
+  useEffect(() => {
+    const unlisten = listen("channel-group-changed", () => {
+      void fetchChannels();
+    });
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, [fetchChannels]);
 
   // Profile switched from the tray menu - sync the whole UI.
   const onProfileChanged = useMixerStore((s) => s.onProfileChanged);

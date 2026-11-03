@@ -223,6 +223,9 @@ pub fn load_profile(
     eq.save().map_err(|e| e.to_string())?;
     target_buses.save().map_err(|e| e.to_string())?;
     wireplumber::write(&assignments).map_err(|e| e.to_string())?;
+    if let Ok(mut restore) = state.channel_group_mute_restore.lock() {
+        *restore = None;
+    }
     // The loaded profile becomes the live-bound (autosaving) one.
     set_active(&state, Some(name))?;
     crate::refresh_tray(&app);

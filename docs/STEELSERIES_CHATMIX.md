@@ -35,18 +35,27 @@ ChatMix. Do not copy a broader rule into `/etc/udev/rules.d`.
 
 The hardware settings list the same physical outputs exposed by Sink's channel
 output selectors, including Easy Effects Sink when it is running. Selecting
-Easy Effects sends the two Balance channels into its input sink. Easy Effects'
+Easy Effects sends every configured channel into its input sink. Easy Effects'
 own output must remain a physical device; routing it back to a Sink channel
 would form a processing loop. Sink does not modify Easy Effects configuration.
 
 ## Auto-switch safety
 
 Auto-switch reacts only after the first confirmed wireless state sample. Merely
-starting or quitting the GUI does not claim or restore an output. On a real
+starting or quitting the GUI does not change an output. If Sink starts while
+the headset is already online, that first sample only prepares a guarded
+restoration snapshot for the first disconnect. On a real
 disconnected-to-connected transition, Sink remembers the prior system default,
-activates the configured destination for Balance A/B, and makes Game the system
-default. On disconnect it releases that temporary Balance A/B destination and
-restores each channel's saved output choice. It restores the remembered system
-default only if the current default is still one of Sink's channels, preserving
-an intervening manual selection of a physical or processing output. Application
+activates the configured destination for every channel, and makes Game the
+system default. It also snapshots the effective physical destination of each
+claimed channel. On disconnect it restores that exact destination when the channel is
+still on the automatically selected output and its saved setting has not
+changed. This matters when "System default" would otherwise select a connected
+dongle whose headset is powered off. It restores the remembered system default
+only if the current default is still one of Sink's channels. Application
 assignments remain on Sink's channels throughout both transitions.
+
+The HID worker does not process reports until the virtual channels and their
+routes have finished initializing. This prevents startup reports from racing
+channel creation or applying a stale ChatMix value to a sink that does not yet
+exist.

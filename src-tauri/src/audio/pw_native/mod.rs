@@ -105,6 +105,11 @@ impl AudioBackend for PipeWireBackend {
         self.request(|reply| Cmd::ResolvedOutputs { reply })
     }
 
+    fn preferred_output_excluding(&self, excluded: &str) -> Result<Option<String>, SinkError> {
+        let excluded = excluded.to_string();
+        self.request(|reply| Cmd::PreferredOutputExcluding { excluded, reply })
+    }
+
     fn set_sink_volume(&self, sink_name: &str, volume_percent: u8) -> Result<(), SinkError> {
         let name = sink_name.to_string();
         self.request(|reply| Cmd::SetNodeVolumeByName {

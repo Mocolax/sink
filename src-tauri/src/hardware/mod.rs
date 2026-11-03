@@ -710,7 +710,7 @@ fn apply_auto_switch(app: &tauri::AppHandle, machine: &mut AutoSwitchState, onli
                         && resolved
                             .get(&name)
                             .and_then(|value| value.as_deref())
-                            .map_or(true, |current| current == target))
+                            .is_none_or(|current| current == target))
                     .then(|| {
                         state
                             .backend
@@ -849,11 +849,11 @@ fn run_device_session(
             let pair_changed = balance_pair(app).is_some_and(|(a, b)| {
                 last_applied
                     .as_ref()
-                    .map_or(true, |event| event.a != a || event.b != b)
+                    .is_none_or(|event| event.a != a || event.b != b)
             });
-            let values_changed = last_applied.as_ref().map_or(true, |event| {
-                event.a_volume != game || event.b_volume != chat
-            });
+            let values_changed = last_applied
+                .as_ref()
+                .is_none_or(|event| event.a_volume != game || event.b_volume != chat);
             if pair_changed || values_changed {
                 match apply_mix(app, game, chat) {
                     Ok(event) => {
